@@ -8,7 +8,7 @@ _Last updated: 2026-09-26 (session 1)._ Branch: `claude/clever-tesla-kk8pm0`, pu
 * This sandbox's network policy **blocks Bybit, xAI and TypeSafe hosts**: integrations are built to
   the documented protocols and tested against local fakes (fake V5 WebSocket server, httpx
   MockTransport). Nothing has touched the real endpoints yet — first real step: `darwin run --mode paper`.
-* Gates: `.venv/bin/pytest` (245 tests, ~3 min on 4 cores; `-m "not slow"`: 242 in ~1 min) ·
+* Gates: `.venv/bin/pytest` (263 tests, ~3 min on 4 cores; `-m "not slow"`: 259 in ~1 min) ·
   `.venv/bin/ruff check src tests` · `.venv/bin/ruff format --check src tests` · `.venv/bin/mypy` (strict).
 
 ## Status
@@ -35,7 +35,14 @@ _Last updated: 2026-09-26 (session 1)._ Branch: `claude/clever-tesla-kk8pm0`, pu
   56eab80 and the following commit (tests: `test_flatten.py`, `test_qm2_regressions.py`,
   `test_testnet_mode.py`, rewritten `test_evolution_science.py`). Fixing it surfaced a real bug:
   exits were priced off a lagging mark, so after a gap a stop could be unfillable.
-* Iteration 3: pending.
+* **Iteration 3 (commit 518e589): 7.6/10, NOT APPROVED.** Iteration-2 critical fixed; clones,
+  audit store and all minors verified. New majors: M1 an acknowledged order whose final report
+  was lost stayed open forever (blocking exits, hiding the mismatch); M2 flatten never closed a
+  venue-only position; M3 live/testnet gave up 60 s after the end; M4 DSL bool arithmetic still
+  allowed unbounded ints; M5 the science criterion also passed on noise. Fixed in 50e2e4b,
+  a11f13f and the following commit. Fixing M3 exposed a real Python 3.12 hazard: `gather()` over
+  finished tasks no longer yields, so `while tasks: await gather(...)` spun forever.
+* Iteration 4 (final): pending.
 
 ## Findings worth knowing
 * **Default-config 168h replay** (`darwin replay --hours 168`, 1.87M events in 151 s): 42 generations,
@@ -77,6 +84,14 @@ _Last updated: 2026-09-26 (session 1)._ Branch: `claude/clever-tesla-kk8pm0`, pu
   agents, and churns capital); fitness-weighted is modestly but not significantly better than equal.
   Default stays `fitness_weighted`. Re-run on recorded real data before believing either.
 
+* **First real-endpoint contact (owner's Mac, paper + `--ai`):** Bybit instruments, klines and
+  tickers OK (backfill 800 bars/symbol), public streams OK; xAI `/v1/models` and `/v1/responses`
+  with X Search returned 200, but one X Search call exceeded the old 30 s timeout (now 180 s);
+  Jev fast path pending (it needed 60 bars, hence the warm start).
+* **Null control at 96h training** (seeds 101–106 vs 201–206): advantage over random genomes
+  planted +7.4% (t 5.3, 6/6) vs null +4.3% (3/6 null seeds produced no champions at all); Welch
+  t 2.04 — suggestive, not robust. Absolute holdout returns: +0.75% vs +0.11% (t 0.48).
+
 ## Next steps (priority)
 0. Lot-aware allocation for a $200 book: fund fewer agents with larger slices, or weight toward symbols
    whose minimum order fits the slice; report unfundable intents on the dashboard.
@@ -90,8 +105,8 @@ _Last updated: 2026-09-26 (session 1)._ Branch: `claude/clever-tesla-kk8pm0`, pu
 3. Evolution efficiency — the science table says this is the real gap: longer training on recorded
    data, multi-window (walk-forward) selection instead of one 24h holdout, and a planted-vs-null
    separation test as the acceptance bar. Consider a lineage-family capital cap.
-3b. Exchange-side catastrophe stops (`/v5/position/trading-stop`) so a crashed process is not
-   unprotected (QM-2 optional item, not done).
+3b. Exchange-side catastrophe stops (`/v5/position/trading-stop`) so a crashed process or an
+   unreachable venue does not leave the account unprotected (QM optional item, not done).
 4. Internal crossing/netting of opposing agent orders in the challenge book (fees).
 5. Crash-resume (currently: restart = new challenge; preflight refuses a non-flat account).
 

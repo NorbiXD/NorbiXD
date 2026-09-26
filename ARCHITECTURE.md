@@ -103,15 +103,18 @@ targeted resubscribe), `feeds.py`, `rest.py`, `gateway.py`, `signing.py`.
   that gapped away from a lagging mark cannot leave a stop unfillable (found by
   `test_stop_loss_exit_goes_through_while_an_increasing_order_is_working`).
 * No ACK within `order_ack_timeout_ms` ⇒ query by `orderLinkId` (open → history → not found),
-  replaying executions. Three silent queries ⇒ `UNKNOWN`, venue health degraded, new risk blocked
-  until the venue answers definitively.
+  replaying executions (idempotent by `exec_id`). An order that *was* acknowledged but whose
+  final state never arrives is queried too: an IOC after 2× the ACK timeout, a resting order
+  after its cancel (or 10× if none was sent). Three silent queries ⇒ `UNKNOWN`, venue health
+  degraded, new risk blocked, re-queried every 10× until the venue answers definitively.
 * Bybit REST: a `retCode 0` create means *request accepted* (ACK). Definitive error codes ⇒
   REJECTED; ambiguous failures (timeouts, 5xx, rate limits) emit nothing and are reconciled;
   `orderLinkId is duplicate` ⇒ the earlier attempt landed ⇒ reconcile. Private-stream reconnect
   ⇒ re-query all open orders + positions.
 * Periodic position snapshots reconcile the challenge account. A mismatch blocks new risk only if
   it persists over two consecutive snapshots with no order in flight and no fill in the last 5s
-  (a snapshot can predate a fill). Venue *business* rejects (Bybit `EC_*` stream reasons and
+  (a snapshot can predate a fill); an order older than 60 s no longer counts as "in flight", so
+  a stuck order cannot hide a mismatch. One `reconcile_mismatch` event per episode. Venue *business* rejects (Bybit `EC_*` stream reasons and
   `110xxx` retCodes: balance, price band, min size, reduce-only) do not degrade venue health;
   lost requests, auth and transport failures do.
 
@@ -144,11 +147,25 @@ sub-position, until ledger, venue positions and working orders are all clear
 (`flatten_complete`). A system exit is never blocked by a working entry (the entry is cancelled
 and the filled quantity exited; a late fill is exited on the next pass); only an in-flight exit
 blocks another one, because an exit that is `UNKNOWN` may already have executed and a duplicate
-would flip the position. Retries per sub-position are rate-bounded. Drivers keep draining after
-the end until everything is flat (bounded; otherwise `flatten_incomplete`). Pinned by
-failure-injection tests: a minute of venue rejects during a kill, partial exit fills, lost exit
-orders that go `UNKNOWN`, a breaker trip under rejects, challenge end under chaos, a resting
-entry at kill time, and a stop racing a working entry (`tests/test_flatten.py`).
+would flip the position (lost final reports are recovered by the stale-order queries of §5).
+Retries per sub-position are rate-bounded.
+
+A position that only the *venue* holds (a manual trade, fills lost for good) is adopted under a
+flatten condition once two consecutive snapshots show it with nothing in flight: it becomes a
+`SYSTEM` sub-position at the current price and is closed through the same governed, persisted
+exit path, with `reduceOnly` so it can never open or flip a position. Book sub-positions that
+exactly offset each other are closed against each other internally (no orders).
+
+**What is guaranteed, and for how long.** The replay driver drains for up to 15 simulated
+minutes after the end; the live driver (sim/paper/testnet/live) keeps the process alive for
+`challenge.end_flatten_timeout_s` (default 30 min), raising `flatten_overdue` every minute,
+and records `flatten_incomplete` if it still has to stop. Within those bounds the account ends
+flat unless the venue refuses every exit for the whole window, or the venue cannot be reached
+at all (no exchange-side catastrophe stops yet: progress.md). Pinned by failure-injection tests:
+a minute of venue rejects during a kill, partial exit fills, lost exit orders that go `UNKNOWN`,
+lost final reports and fills, a venue-only position, a breaker trip under rejects, challenge end
+under chaos, 5 minutes of rejected exits after a testnet end, a resting entry at kill time, and
+a stop racing a working entry (`tests/test_flatten.py`, `tests/test_testnet_mode.py`).
 
 The challenge book also re-syncs to the shadow books every bar: if an exit filled in an agent's
 shadow book but not in the challenge book (a reject, a stop hit at a different entry, a lost
@@ -260,6 +277,13 @@ cross, position mode is one-way, and per-symbol leverage is set. During the run,
 PnL is continuously compared with ledger PnL; drift beyond tolerance blocks new risk. Breakers
 and the kill switch are evaluated on every heartbeat, not only at bar close.
 
+**Warm start.** Paper/testnet/live start with no history, which used to leave the fast AI path
+(it needs 60 bars) and long-lookback agents idle for up to hours. At start, up to 800 closed
+1-minute candles per symbol are loaded from Bybit's public kline endpoint into the feature
+history — indicators only: nothing is marked, no agent decides, no evidence or fitness is
+recorded, and the still-forming candle is dropped. Candles carry OHLCV only, so trade-flow,
+book and liquidation features warm up from live data.
+
 ## 13. Synthetic market (known-answer environment)
 
 Regime-switching (trend/range/high-vol) with planted, cost-aware structure: trend drift,
@@ -280,7 +304,10 @@ past state. The `IntelligenceService` is a bar observer: requests never block de
 outputs become `IntelligenceSignal`s stamped with their **arrival** time (live: receive time;
 replay: `now + simulated latency`), so agents can only use a model output after it could have
 existed (the future-perturbation test also runs with intelligence enabled). Failing providers
-are paused (circuit breaker). Signals are persisted with provider, model, payload and latency
+are paused (circuit breaker); failures are logged with their exception type. X Search is agentic
+and slow (20–60 s is normal), so the slow path's timeout is 180 s — it is asynchronous and never
+delays a decision. `darwin run --ai` switches the mock off and refuses to start without the
+provider keys, so a missing key can never silently turn "AI mode" into "mock mode". Signals are persisted with provider, model, payload and latency
 and appear in `explain`. External feeds implement `ExternalSignalFeed`; the webhook feed
 requires a timestamped HMAC signature (5-minute replay window), bounds the body while streaming,
 rejects NaN/Infinity and implausible `observed_ts`, validates schema and symbols, dedupes ids,
@@ -296,15 +323,16 @@ Platforms whose terms do not permit this use stay `DisabledFeed`s.
   champion-set JSON (`darwin run --seed-genomes`). Train→holdout degradation is reported
   (winner's curse / overfitting).
 * Known answers (`tests/test_evolution_science.py`), always across seeds and against a baseline
-  of random, unselected genomes evaluated on the same holdout bars: on the planted market
-  selected genomes beat random genomes out of sample (6 seeds, mean +5.5%, seed-level t ≈ 3.0);
-  on the null market selection produces no positive out-of-sample return and train winners
-  degrade. **Not claimed, because the data does not support it:** separation of planted from
-  null in absolute holdout returns (t ≈ 1.1 over 10 vs 6 seeds), or convergence on trend-family
-  species (seed-dependent: some seeds converge on liquidation or mean-reversion hybrids). Part of
-  the edge over random genomes is cost/risk avoidance, which also exists on noise. Hand-built
-  momentum/breakout genomes do earn +26…+47% at 1x over 3 days on the planted market, so the
-  gap is in the search, not the environment (progress.md).
+  of random, unselected genomes evaluated on the same holdout bars. **Proven:** selection avoids
+  the losses of random deployment — on the planted market (6 seeds, +5.3%, t ≈ 3.0) *and* on the
+  null market (+2.9%), which on noise can only be cost/risk avoidance; and on the null market
+  selection produces no positive out-of-sample return and train winners degrade. **Not proven
+  (an open problem, not a claim):** that evolution *discovers the planted edge*. The null-
+  controlled comparison (planted advantage minus null advantage) points the right way but is not
+  significant (48h training: t ≈ 1.3; 96h: t ≈ 2.0 with only 3 of 6 null seeds producing
+  champions); absolute holdout returns do not separate the markets (t ≈ 0.5); trend-family
+  convergence is seed-dependent. Hand-built momentum/breakout genomes earn +26…+47% at 1x over
+  3 days on the planted market, so the gap is in the search, not the environment.
 * `darwin bench-allocators`: equal vs fitness-weighted vs Thompson on identical seeds. Because
   evaluation happens on shadow books, the population and its decisions are *identical* across
   allocators for a given seed, so the comparison is perfectly paired (results in progress.md).
@@ -314,16 +342,20 @@ Platforms whose terms do not permit this use stay `DisabledFeed`s.
 `research/`: proposals are DSL source (`dsl.py`), a statically verified Python subset where the
 only reachable attributes are `v.<feature API>` and `math.<fn>` (no imports, loops,
 comprehensions, lambdas, `**`, keywords, dunders, decorators or annotations). Values are bounded
-by construction: no string constants except parameter keys and signal topics, integer constants
-outside feature arguments compile as floats and `int()` is only allowed inside feature
-arguments, so `"a" * 999999999`-style memory bombs cannot be written. Promoted code runs
-in-process, and any exception it raises quarantines that agent only (killed with lineage
-`runtime_error`, positions flattened); the bar loop continues. `sandbox.py` runs every other stage in a subprocess with a scrubbed environment (no
+by construction: no string constants except parameter keys and signal topics; outside feature
+arguments every arithmetic operand is coerced with `float()` at compile time (constants, names,
+bools and comparison results alike), so `"a" * 999999999` cannot be written and
+`x = True + True` followed by forty `x = x * x` overflows to `inf` in microseconds instead of
+building a 2^40-bit integer (QM iteration 3); `int()` is only allowed inside feature arguments,
+where no reassignment can happen. Promoted code runs in-process: any exception it raises, or a
+decision step slower than `evolution.max_decide_ms`, quarantines that agent only (killed with
+lineage `runtime_error`, positions flattened); the bar loop continues. `sandbox.py` runs every other stage in a subprocess with a scrubbed environment (no
 credentials), CPU/memory rlimits, `RLIMIT_FSIZE=0`, no database and a timeout: unit tests on
 real FeatureViews (bounded, deterministic, stateless, not dead code, fast), a leakage check,
 train replay with fees and slippage, holdout, and a challenger comparison against the champion
-on identical bars. Passing species are saved to a registry, re-validated on load (source and a
-fully passing report), registered as
+on identical bars. Passing species are saved to a registry, re-validated on load (the source
+must pass the DSL validator, hash to the record's proposal id, and carry a fully passing
+report), registered as
 primitives (origin `sandbox:<id>`) and injected into the live population as challengers (lineage
 `proposed`). `TemplateProposer` is an offline proposer; `LLMProposer` wraps any frontier model.
 The Risk Governor and execution engine sit outside all of this and are not evolvable.

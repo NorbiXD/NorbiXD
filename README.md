@@ -31,7 +31,8 @@ uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -e ".[de
 # 3. "Why did agent A0012 go short SOL at 14:03?"
 .venv/bin/darwin explain --run <run_id> --agent A0012 --symbol SOLUSDT --at 2026-09-26T14:03:00Z
 
-# 4. Paper trading on Bybit's real public streams (no keys needed)
+# 4. Paper trading on Bybit's real public streams (no keys needed). Starts warm: the last 800
+#    closed 1m candles are preloaded, so indicators and the AI fast path work immediately.
 .venv/bin/darwin run --mode paper
 
 # 4b. Paper trading driven by the real AI providers instead of the mock
@@ -69,9 +70,13 @@ docker compose up --build
   record, and are not reachable from agents, evolution or LLM providers.
 * `touch KILL` (or `POST /api/kill-switch` with `DARWIN_OPERATOR_TOKEN`) halts new risk,
   cancels working entries and flattens the challenge account, **retrying every heartbeat until
-  it is actually flat** (venue rejects, partial fills and lost orders are retried; tested by
-  failure injection). Breakers and the end of the challenge flatten the same way. Getting flat is
-  never blocked by the safety system.
+  ledger, venue and orders are all clear**: rejects, partial fills, lost orders and lost fills
+  are retried or recovered, and positions only the exchange knows about are closed with
+  `reduceOnly`. Breakers and the end of the challenge flatten the same way; after the end a live
+  run keeps trying for `end_flatten_timeout_s` (30 min) and alerts every minute. There are no
+  exchange-side stop orders yet, so an exchange that stays unreachable (or a crashed process)
+  cannot be flattened by DARWIN — that is the remaining gap. Getting flat is never blocked by
+  the safety system.
 * Machine-generated species run in-process only after passing a static allowlist DSL and a
   credential-free sandbox; a species that raises is quarantined, not the trading loop.
 * Tests never need credentials or network.
@@ -79,9 +84,9 @@ docker compose up --build
 ## Development
 
 ```bash
-.venv/bin/pytest            # 245 tests: look-ahead perturbation, e2e evolution, multi-seed known-answer
-                            # science, chaos + flatten failure injection, testnet wiring against a fake
-                            # Bybit, governor property tests (-m "not slow" skips the ~3 min ones)
+.venv/bin/pytest            # look-ahead perturbation, e2e evolution, multi-seed known-answer science,
+                            # chaos + flatten failure injection, testnet wiring against a fake Bybit,
+                            # DSL bomb tests, governor property tests (-m "not slow" skips ~3 min)
 .venv/bin/ruff check src tests && .venv/bin/ruff format --check src tests
 .venv/bin/mypy              # strict
 ```

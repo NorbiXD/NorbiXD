@@ -5,18 +5,19 @@ seed proved nothing (QM iteration 2). Per seed: evolve 48h on one path, freeze t
 and evaluate them on the next, unseen 24h together with 12 *random, unselected* genomes on the
 same bars.
 
-What the data supports (and what these tests pin):
+What these tests prove — and, as importantly, what they do not:
 
-* Planted market (a capturable trend edge exists): selected genomes beat random genomes out of
-  sample, consistently across seeds (seed-level t > 2).
-* Null market (no structure): selection produces no positive out-of-sample return, and train
-  winners degrade.
-
-What the data does NOT support, and so is deliberately not asserted: that selection separates
-the planted market from the null one in *absolute* returns, or that it always converges on
-trend-family species. Part of the edge over random genomes is cost/risk avoidance, which also
-exists on noise (random genomes overtrade). With 48h of training the directional edge beyond
-noise is weak (see progress.md for the per-seed table).
+* **Selection beats random deployment, on both markets.** Selected genomes lose much less than
+  random genomes out of sample on the planted *and* on the null market. On noise this can only
+  be cost/risk avoidance (random genomes overtrade and size badly), so this is NOT evidence that
+  evolution discovers the planted edge (QM iteration 3, M5). The test is named for what it shows.
+* **No false discovery:** on the null market selection produces no positive out-of-sample
+  return, and train winners degrade.
+* **Direction of the null control only:** the advantage over random genomes is larger on the
+  planted market than on the null one, but NOT significantly so at this budget (48h training:
+  Welch t ~ 1.3; 96h: t ~ 2.0 with only 3 null seeds producing champions). Absolute holdout
+  returns do not separate the markets (t ~ 0.5). Edge discovery is therefore an open problem,
+  not a claim (progress.md has the per-seed tables).
 """
 
 from __future__ import annotations
@@ -89,7 +90,7 @@ def _t(x: np.ndarray) -> float:
 
 
 @pytest.mark.slow
-def test_selected_genomes_beat_random_genomes_out_of_sample_on_the_planted_market(
+def test_selection_avoids_the_losses_of_random_deployment_on_both_markets(
     results: dict[str, list[dict[str, Any]]],
 ) -> None:
     rows = [r for r in results["planted"] if r["excess"] is not None]
@@ -97,6 +98,20 @@ def test_selected_genomes_beat_random_genomes_out_of_sample_on_the_planted_marke
     excess = np.array([r["excess"] for r in rows])
     assert excess.mean() > 0.0 and _t(excess) > 2.0, excess
     assert (excess > 0).sum() >= len(rows) - 2, excess
+    # the same holds on noise, which is exactly why this is not evidence of edge discovery
+    null_excess = np.array([r["excess"] for r in results["null"] if r["excess"] is not None])
+    assert null_excess.size == 0 or null_excess.mean() > 0.0, null_excess
+
+
+@pytest.mark.slow
+def test_null_control_direction_planted_advantage_exceeds_null_advantage(
+    results: dict[str, list[dict[str, Any]]],
+) -> None:
+    """Direction only (not significant at this budget; see module docstring): a regression guard
+    against evolution doing *better* on noise than on a market with a real edge."""
+    planted = np.array([r["excess"] for r in results["planted"] if r["excess"] is not None])
+    null = np.array([r["excess"] for r in results["null"] if r["excess"] is not None])
+    assert null.size == 0 or planted.mean() > null.mean(), (planted, null)
 
 
 @pytest.mark.slow
