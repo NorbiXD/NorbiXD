@@ -120,3 +120,25 @@ async def test_testnet_keeps_flattening_past_the_old_60s_cutoff_when_exits_are_r
     assert not eng.ledger[CHALLENGE].open_positions() and not eng.execution.open_orders()
     assert all(q == 0 for q, _ in fake.positions.values())
     assert not eng.gateways[CHALLENGE_VENUE]._tasks  # REST work drained before the client closed
+
+
+async def test_a_position_outside_the_challenge_symbols_is_ignored_not_fatal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """QM iteration 4, C1: a DOGE position on the same account blocked all new risk after two
+    snapshots and then crashed the process (KeyError) at the first flatten, before any exit."""
+
+    def tweak(fake: FakeBybitExchange, eng: Any, clock: Clock) -> None:
+        fake.positions["DOGEUSDT"] = [1_000.0, 0.1]  # someone else's position on the account
+        fake.mark = lambda s: eng.market[s].ref_price() if s in eng.market else None
+
+    eng, fake, _cfg, final, _symbols = await _run_testnet(monkeypatch, tweak)
+    creates = [a for p, a in fake.calls if p == "/v5/order/create"]
+    assert final > 0 and eng.ended
+    assert len(creates) >= 5 and all(a["symbol"] != "DOGEUSDT" for a in creates)  # never touched
+    assert fake.positions["DOGEUSDT"][0] == 1_000.0
+    assert eng.stats["sys:foreign_symbol"] >= 1 and eng.foreign_positions == {"DOGEUSDT": 1_000.0}
+    assert eng.stats["sys:reconcile_mismatch"] == 0 and eng.health[CHALLENGE_VENUE].reconcile_ok
+    assert eng.stats["sys:flatten_complete"] == 1 and eng.stats["sys:flatten_incomplete"] == 0
+    assert not eng.ledger[CHALLENGE].open_positions()
+    assert all(q == 0 for s, (q, _) in fake.positions.items() if s != "DOGEUSDT")

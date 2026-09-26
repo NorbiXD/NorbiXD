@@ -73,10 +73,12 @@ docker compose up --build
   ledger, venue and orders are all clear**: rejects, partial fills, lost orders and lost fills
   are retried or recovered, and positions only the exchange knows about are closed with
   `reduceOnly`. Breakers and the end of the challenge flatten the same way; after the end a live
-  run keeps trying for `end_flatten_timeout_s` (30 min) and alerts every minute. There are no
-  exchange-side stop orders yet, so an exchange that stays unreachable (or a crashed process)
-  cannot be flattened by DARWIN — that is the remaining gap. Getting flat is never blocked by
-  the safety system.
+  run keeps trying for `end_flatten_timeout_s` (30 min) and alerts every minute. **Ctrl-C (or
+  SIGTERM) ends the challenge and flattens first**; press it again to exit immediately.
+  DARWIN only ever trades, books and flattens the challenge symbols: positions in other symbols
+  on the same account are ignored and reported (live refuses to start with them). There are no
+  exchange-side stop orders yet, so an exchange that stays unreachable (or a killed process)
+  cannot be flattened by DARWIN — that is the remaining gap. Risk limits never block an exit.
 * Machine-generated species run in-process only after passing a static allowlist DSL and a
   credential-free sandbox; a species that raises is quarantined, not the trading loop.
 * Tests never need credentials or network.

@@ -159,13 +159,27 @@ exactly offset each other are closed against each other internally (no orders).
 **What is guaranteed, and for how long.** The replay driver drains for up to 15 simulated
 minutes after the end; the live driver (sim/paper/testnet/live) keeps the process alive for
 `challenge.end_flatten_timeout_s` (default 30 min), raising `flatten_overdue` every minute,
-and records `flatten_incomplete` if it still has to stop. Within those bounds the account ends
-flat unless the venue refuses every exit for the whole window, or the venue cannot be reached
-at all (no exchange-side catastrophe stops yet: progress.md). Pinned by failure-injection tests:
+and records `flatten_incomplete` if it still has to stop. Within those bounds, and for the
+challenge symbols only, the account ends flat unless the venue refuses every exit for the whole
+window or cannot be reached at all, or the process itself dies (no exchange-side catastrophe
+stops yet: progress.md). Positions in *other* symbols on the same exchange account are never
+booked, adopted or closed: they are reported once (`foreign_symbol`), live preflight refuses
+to start with them, and the wallet-PnL check pauses while they are open (QM iteration 4, C1:
+they used to block all trading and then crash the first flatten). The optional flatten steps
+(adoption, internal crossing) run under exception isolation, and the live driver isolates
+errors per event and engages the kill switch after three in a row, so a bug cannot stop exits
+from being sent. Ctrl-C/SIGTERM end the challenge and flatten through the same path (a second
+Ctrl-C exits immediately). Every reconcile interval the venue's open orders are swept: orders
+we think are working but the venue no longer lists get their final state fetched, orders on
+challenge symbols we did not place are reported (`foreign_order`); a lost cancel is re-sent
+while the order keeps working, and a definitive venue answer resets the query count. Adoption
+of a venue-only position requires a snapshot younger than 5 s and newer than the symbol's last
+fill. Pinned by failure-injection tests:
 a minute of venue rejects during a kill, partial exit fills, lost exit orders that go `UNKNOWN`,
 lost final reports and fills, a venue-only position, a breaker trip under rejects, challenge end
-under chaos, 5 minutes of rejected exits after a testnet end, a resting entry at kill time, and
-a stop racing a working entry (`tests/test_flatten.py`, `tests/test_testnet_mode.py`).
+under chaos, 5 minutes of rejected exits after a testnet end, a foreign-symbol position on the
+testnet account, a lost cancel, an operator stop, a resting entry at kill time, and a stop
+racing a working entry (`tests/test_flatten.py`, `tests/test_testnet_mode.py`).
 
 The challenge book also re-syncs to the shadow books every bar: if an exit filled in an agent's
 shadow book but not in the challenge book (a reject, a stop hit at a different entry, a lost
@@ -281,8 +295,11 @@ and the kill switch are evaluated on every heartbeat, not only at bar close.
 (it needs 60 bars) and long-lookback agents idle for up to hours. At start, up to 800 closed
 1-minute candles per symbol are loaded from Bybit's public kline endpoint into the feature
 history — indicators only: nothing is marked, no agent decides, no evidence or fitness is
-recorded, and the still-forming candle is dropped. Candles carry OHLCV only, so trade-flow,
-book and liquidation features warm up from live data.
+recorded, and the still-forming candle is dropped. Candles carry OHLCV only: taker flow, book,
+liquidations, funding and open interest are marked *unknown* (NaN) — never invented — so the
+features built on them return "not available" until their window holds enough live data
+(holding funding at the current value made the first real change look like a 15–27σ move:
+QM iteration 4, M-A).
 
 ## 13. Synthetic market (known-answer environment)
 
@@ -307,7 +324,8 @@ existed (the future-perturbation test also runs with intelligence enabled). Fail
 are paused (circuit breaker); failures are logged with their exception type. X Search is agentic
 and slow (20–60 s is normal), so the slow path's timeout is 180 s — it is asynchronous and never
 delays a decision. `darwin run --ai` switches the mock off and refuses to start without the
-provider keys, so a missing key can never silently turn "AI mode" into "mock mode". Signals are persisted with provider, model, payload and latency
+provider keys, so a missing key can never silently turn "AI mode" into "mock mode"; it also
+refuses an accelerated sim, where wall-clock provider intervals would multiply API calls. Signals are persisted with provider, model, payload and latency
 and appear in `explain`. External feeds implement `ExternalSignalFeed`; the webhook feed
 requires a timestamped HMAC signature (5-minute replay window), bounds the body while streaming,
 rejects NaN/Infinity and implausible `observed_ts`, validates schema and symbols, dedupes ids,
@@ -342,12 +360,16 @@ Platforms whose terms do not permit this use stay `DisabledFeed`s.
 `research/`: proposals are DSL source (`dsl.py`), a statically verified Python subset where the
 only reachable attributes are `v.<feature API>` and `math.<fn>` (no imports, loops,
 comprehensions, lambdas, `**`, keywords, dunders, decorators or annotations). Values are bounded
-by construction: no string constants except parameter keys and signal topics; outside feature
-arguments every arithmetic operand is coerced with `float()` at compile time (constants, names,
-bools and comparison results alike), so `"a" * 999999999` cannot be written and
-`x = True + True` followed by forty `x = x * x` overflows to `inf` in microseconds instead of
-building a 2^40-bit integer (QM iteration 3); `int()` is only allowed inside feature arguments,
-where no reassignment can happen. Promoted code runs in-process: any exception it raises, or a
+by construction: no string constants except parameter keys and signal topics; `p` may appear
+only as `p["key"]` and `v`/`math` only as attribute owners (a bare `p` let `min(p)` return a
+key, i.e. a string: QM iteration 4, M-B); outside feature arguments every arithmetic operand is
+coerced with `float()` at compile time (constants, names, bools and comparison results alike),
+so `x = True + True` followed by forty `x = x * x` overflows to `inf` in microseconds instead
+of building a 2^40-bit integer (QM iteration 3); every feature-call argument passes through a
+bounded-lookback check (a finite number, clamped to 0..10 000), and `int()` is only allowed
+inside feature arguments, where no reassignment can happen. The decision-time budget measures
+after the call returns (it cannot interrupt a runaway call — the value bounds are what prevent
+one); decisions measured at p99 0.2 ms, max 1.7 ms against the 500 ms default. Promoted code runs in-process: any exception it raises, or a
 decision step slower than `evolution.max_decide_ms`, quarantines that agent only (killed with
 lineage `runtime_error`, positions flattened); the bar loop continues. `sandbox.py` runs every other stage in a subprocess with a scrubbed environment (no
 credentials), CPU/memory rlimits, `RLIMIT_FSIZE=0`, no database and a timeout: unit tests on

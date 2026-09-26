@@ -97,6 +97,27 @@ class BybitExecutionGateway:
     def query_positions(self, account: str, ts: int) -> None:
         self._spawn(self._positions())
 
+    def query_open_orders(self, account: str, ts: int) -> None:
+        self._spawn(self._open_orders())
+
+    async def _open_orders(self) -> None:
+        """Venue-wide sweep of working orders: catches lost final reports (an order we think is
+        working but the venue no longer lists) and orders on our symbols we did not place."""
+        try:
+            rows = [r for r in await self.rest.open_orders() if r.get("symbol") in self.instruments]
+        except (BybitApiError, httpx.HTTPError, TimeoutError) as e:
+            log.info("open-order sweep failed: %s", e)
+            return
+        recv = self.clock_ms()
+        listed: set[str] = set()
+        for ev in parse_private({"topic": "order", "data": rows}, recv, self.account):
+            if isinstance(ev, OrderUpdate):
+                listed.add(ev.client_order_id)
+                self.emit(ev.model_copy(update={"reason": "open_orders_sweep"}))
+        for cid, sym in list(self.open_ids.items()):
+            if cid not in listed:
+                await self._query(sym, cid)  # left the book: fetch its final state and executions
+
     # ------------------------------------------------------------------ internals
     def _order_params(self, o: OrderRequest) -> dict[str, Any]:
         spec = self.instruments[o.symbol]

@@ -51,9 +51,10 @@ async def account_preflight(
         problem(f"wallet equity {rep.equity:.2f} < starting capital {cfg.challenge.starting_capital:.2f}")
 
     symbols = set(cfg.challenge.symbols)
+    all_positions = await rest.positions()
     open_pos = [
         f"{p['symbol']}:{p.get('side')}:{p.get('size')}"
-        for p in await rest.positions()
+        for p in all_positions
         if p.get("symbol") in symbols and float(p.get("size") or 0.0) != 0.0
     ]
     if open_pos:
@@ -65,6 +66,15 @@ async def account_preflight(
     ]
     if working:
         problem(f"account has open orders on challenge symbols: {working}", hard=True)
+    foreign = [
+        f"{p['symbol']}:{p.get('side')}:{p.get('size')}"
+        for p in all_positions
+        if p.get("symbol") not in symbols and float(p.get("size") or 0.0) != 0.0
+    ]
+    if foreign:
+        # tolerated on testnet (ignored, never booked or closed), refused for live: a shared
+        # account makes wallet reconciliation meaningless and invites operator mistakes
+        problem(f"account holds positions outside the challenge symbols: {foreign}")
 
     info = await rest.account_info()
     rep.margin_mode = str(info.get("marginMode", ""))

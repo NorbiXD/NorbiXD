@@ -261,7 +261,9 @@ def test_dsl_arithmetic_is_float_only_so_squaring_bombs_overflow_instead_of_allo
 
     t0 = time.perf_counter()
     out = fn(V(), {"a": 1.5})
-    assert time.perf_counter() - t0 < 0.05  # ...but it cannot build a 2**40-bit integer
+    # ...but it cannot build a 2**40-bit integer (26 real squarings already took 0.23 s; 40 would
+    # need ~128 GB): generous bound so a GC pause on a loaded machine cannot flake the test
+    assert time.perf_counter() - t0 < 1.0
     assert isinstance(out, float) and out == float("inf")
 
 
@@ -300,3 +302,35 @@ def test_slow_species_are_quarantined_by_the_decision_time_budget() -> None:
         assert h.engine.stats["quarantined"] == 1 and h.engine.ended
     finally:
         PRIMITIVES.pop("test_slow", None)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "    return v.ret(min(p) * 99999999)",  # QM iteration 4, M-B: min(p) is a *key* (a string)
+        "    k = min(p)\n    return 0.0",
+        "    x = p\n    return 0.0",
+        "    f = v\n    return 0.0",
+        "    m = math\n    return 0.0",
+        "    return max(p, p)",
+    ],
+)
+def test_dsl_rejects_bare_p_v_math(body: str) -> None:
+    with pytest.raises(DSLError):
+        validate(_with_body(body))
+
+
+def test_dsl_feature_arguments_are_bounded_lookbacks() -> None:
+    src = _with_body(
+        "    a = v.ret(int(p['a']) * 999999999 * 999999999)\n    b = v.ret(-5)\n    return v.ret(3 * 2)"
+    )
+    fn = compile_score(validate(src))
+    seen: list[object] = []
+
+    class V:
+        def ret(self, n: object) -> float:
+            seen.append(n)
+            return 0.0
+
+    fn(V(), {"a": 1.5})
+    assert seen == [10_000, 0, 6] and all(type(n) is int for n in seen)

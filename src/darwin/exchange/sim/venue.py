@@ -57,7 +57,7 @@ class CancelArrival(Event):
 class QueryArrival(Event):
     kind: Literal["query_arrival"] = "query_arrival"
     account: str
-    what: Literal["order", "positions"]
+    what: Literal["order", "positions", "open_orders"]
     client_order_id: str | None = None
     symbol: str | None = None
 
@@ -163,6 +163,10 @@ class SimExchange:
         arrive = ts + self._latency(self.sim.latency)
         self.scheduler.schedule(arrive, QueryArrival(ts=arrive, account=account, what="positions"), self)
 
+    def query_open_orders(self, account: str, ts: int) -> None:
+        arrive = ts + self._latency(self.sim.latency)
+        self.scheduler.schedule(arrive, QueryArrival(ts=arrive, account=account, what="open_orders"), self)
+
     # ------------------------------------------------------------------ event entry points
     def on_market(self, ev: MarketDataEvent) -> None:
         self.now = max(self.now, ev.ts)
@@ -246,6 +250,9 @@ class SimExchange:
                 o.status = OrderStatus.REJECTED
                 self._emit(ack_ts, self._update(o, ack_ts, "reduce_only_would_increase"))
                 return
+            if req.qty > abs(pos):  # like Bybit: a reduce-only order never flips the position
+                req = req.model_copy(update={"qty": abs(pos)})
+                o.req = req
 
         drop_ack = bool(self.chaos.drop_ack_prob) and self.rng.random() < self.chaos.drop_ack_prob
         ack_emit_ts = ack_ts + self.chaos.late_ack_ms
@@ -413,6 +420,11 @@ class SimExchange:
 
     def _on_query(self, ev: QueryArrival) -> None:
         ack = ev.ts + self._latency(self.sim.ack_latency)
+        if ev.what == "open_orders":
+            for (owner, _cid), working in self.orders.items():
+                if owner == ev.account and not working.status.terminal:
+                    self._emit(ack, self._update(working, ack, "open_orders_sweep"))
+            return
         if ev.what == "positions":
             acct = self.accounts.get(ev.account)
             if acct is None:

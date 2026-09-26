@@ -266,3 +266,17 @@ def test_ai_flag_enables_real_providers_disables_mock_and_never_falls_back(
     assert type(svc.decision).__name__ == "JevProvider" and type(svc.narrative).__name__ == "GrokProvider"
     only_grok = _config(argparse.Namespace(config=None, mode="paper", ai="grok")).intelligence
     assert only_grok.grok.enabled and not only_grok.jev.enabled and not only_grok.mock.enabled
+
+
+def test_ai_flag_refuses_accelerated_sim(monkeypatch: pytest.MonkeyPatch) -> None:
+    import argparse
+
+    from darwin.cli import _check_ai, _config
+
+    monkeypatch.setenv("TYPESAFE_API_KEY", "k")
+    monkeypatch.setenv("XAI_API_KEY", "k")
+    fast = _config(argparse.Namespace(config=None, mode="sim", ai="jev,grok", speed=120))
+    problem = _check_ai(fast)
+    assert problem is not None and "120" in problem  # API calls would scale with the speed
+    real_time = _config(argparse.Namespace(config=None, mode="sim", ai="jev,grok", speed=1))
+    assert _check_ai(real_time) is None

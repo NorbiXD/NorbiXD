@@ -130,6 +130,10 @@ class FlakyGateway:
         if not self.down:
             self.inner.query_positions(account, ts)
 
+    def query_open_orders(self, account: str, ts: int) -> None:
+        if not self.down:
+            self.inner.query_open_orders(account, ts)
+
 
 def watch_flat(script: Script, key: str, after: int) -> Step:
     def mark(eng: DarwinEngine, ts: int) -> None:
@@ -403,7 +407,7 @@ def test_lost_terminal_updates_and_fills_of_exits_are_recovered_by_query_and_fla
     assert lossy and dropped["n"] >= len(lossy)
     stuck = [eng.execution.orders[c] for c in lossy]
     assert all(o.status.terminal and not o.open for o in stuck), [o.status for o in stuck]
-    assert all(o.queries >= 1 for o in stuck)  # recovered by querying the venue
+    assert all(o.reason == "query" for o in stuck)  # final state came from querying the venue
     # executions were replayed by the query, so the exits counted once: no double exit
     assert script.log["flat"] - script.log["kill"] <= 60_000
     assert eng.stats["sys:flatten_incomplete"] == 0
@@ -454,3 +458,99 @@ def test_a_position_that_only_the_venue_holds_is_adopted_and_closed_under_kill()
     assert eng.stats["sys:reconcile_mismatch"] <= 2  # one event per episode, not per snapshot
     assert eng.stats["sys:flatten_incomplete"] == 0
     assert_everything_flat(h)
+
+
+def test_a_lost_cancel_on_a_resting_order_is_resent_and_the_order_never_goes_unknown() -> None:
+    """QM iteration 4, M-C: one lost cancel left a stale entry resting on the venue while the
+    order flapped between New and UNKNOWN, blocking new risk ~77% of the time."""
+    from tests.conftest import book, ticker, trade
+
+    cfg = make_config(challenge={"symbols": ["ETHUSDT"]})
+    h = build_replay(cfg, iter([]), T0)
+    eng = h.engine
+    flaky = FlakyGateway(eng.gateways[CHALLENGE_VENUE])
+    eng.gateways[CHALLENGE_VENUE] = flaky
+    dropped = {"n": 0}
+    real_cancel = flaky.inner.cancel
+
+    def lossy_cancel(account: str, cid: str, symbol: str, ts: int) -> None:
+        if dropped["n"] == 0:
+            dropped["n"] += 1  # the first cancel request is lost on the way
+            return
+        real_cancel(account, cid, symbol, ts)
+
+    flaky.inner.cancel = lossy_cancel  # type: ignore[method-assign]
+    for ev in (book("ETHUSDT", T0 + 1, 3000.0, qty=50.0), ticker("ETHUSDT", T0 + 1, 3000.0)):
+        h.driver._dispatch_market(ev)
+    h.driver._dispatch_market(trade("ETHUSDT", T0 + 2, 3000.0, tid="a"))
+    eng.now = T0 + 2
+    eng.marks = {"ETHUSDT": 3000.0}
+    eng.weights = {"A0001": 0.5}
+    eng._route(
+        TradeIntent(
+            intent_id="I-rest",
+            ts=eng.now,
+            agent_id="A0001",
+            genome_id="G",
+            symbol="ETHUSDT",
+            target_exposure=1.0,
+            confidence=0.6,
+            reason="entry",
+            urgency=Urgency.PASSIVE,
+            stop_loss_pct=0.02,
+        ),
+        only=CHALLENGE,
+    )
+    (order,) = eng.execution.open_orders()
+    statuses: set[OrderStatus] = set()
+    for t in range(T0 + 1_000, T0 + 120_000, 1_000):  # two minutes of heartbeats
+        _pump(h, t)
+        eng.handle(TimerEvent(ts=t, name="heartbeat"))
+        statuses.add(order.status)
+        if order.status.terminal:
+            break
+    assert dropped["n"] == 1 and order.status is OrderStatus.CANCELED  # the cancel was re-sent
+    assert OrderStatus.UNKNOWN not in statuses and eng.health[CHALLENGE_VENUE].reconcile_ok
+
+
+def test_operator_stop_ends_the_challenge_and_flattens() -> None:
+    """Ctrl-C / SIGTERM call stop_early: the challenge ends now and flattens through the normal
+    path instead of the process dying with positions open."""
+    steps: list[Step] = []
+    h, script = funded_replay(steps)
+
+    def stop(eng: DarwinEngine, ts: int) -> None:
+        script.log["stop"] = ts
+        script.log["positions"] = len(eng.ledger[CHALLENGE].open_positions())
+        eng.stop_early("interrupt")
+
+    steps += [Step(T0 + 90 * 60_000, stop, has_positions)]
+    h.driver.run()
+    eng = h.engine
+    assert script.log["positions"] >= 2 and eng.ended and eng.stats["sys:stop_requested"] == 1
+    assert eng.stats["sys:flatten_complete"] == 1
+    assert_everything_flat(h)
+
+
+def test_sim_reduce_only_is_capped_at_the_position_like_bybit() -> None:
+    from darwin.core.types import OrderType, Side, TimeInForce
+    from tests.conftest import book
+
+    h = build_replay(make_config(challenge={"symbols": ["ETHUSDT"]}), iter([]), T0)
+    venue = h.challenge
+    h.driver._dispatch_market(book("ETHUSDT", T0 + 1, 3000.0, qty=50.0))
+    venue._apply_position(CHALLENGE, "ETHUSDT", Side.BUY, 0.05, 3000.0, 0.0)
+    req = OrderRequest(
+        client_order_id="C-SYSTEM-1",
+        account=CHALLENGE,
+        symbol="ETHUSDT",
+        side=Side.SELL,
+        qty=0.2,  # more than the 0.05 held
+        order_type=OrderType.LIMIT,
+        tif=TimeInForce.IOC,
+        limit_price=2900.0,
+        reduce_only=True,
+        ts=T0 + 2,
+    )
+    venue._on_arrival(req, T0 + 2)
+    assert venue.position(CHALLENGE, "ETHUSDT") == pytest.approx(0.0, abs=1e-12)  # flat, not short

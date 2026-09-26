@@ -80,17 +80,17 @@ class Runtime:
 async def backfill_from_bybit(engine: DarwinEngine, rest: BybitRest, n: int) -> dict[str, int]:
     """Preload the last ``n`` closed 1-minute candles per symbol (public endpoints, no keys).
 
-    Candles carry OHLCV only: trade-flow, book, liquidation and funding/OI *changes* start from
-    live data (flow is split evenly, funding/OI are held at the current ticker values), so those
-    microstructure features warm up over the first minutes rather than seeing a fake jump."""
+    Candles carry OHLCV only. Everything else — taker buy/sell split, book, liquidations,
+    funding and open interest — is marked *unknown* (NaN), never invented: features whose window
+    still contains warm bars return NaN ("not available") until enough live data has arrived.
+    Holding funding at the current value, as an earlier version did, made the first real change
+    look like a 15-27 sigma move (QM iteration 4, M-A)."""
     if n <= 0 or engine.bar_ms != 60_000:
         return {}
+    unknown = float("nan")
     bars: dict[str, list[Bar]] = {}
     for sym in engine.symbols:
         rows = await rest.klines(sym, limit=min(1_000, n + 1))
-        tk = await rest.ticker(sym)
-        funding = float(tk.get("fundingRate") or 0.0)
-        oi = float(tk.get("openInterest") or 0.0)
         bars[sym] = [
             Bar(
                 symbol=sym,
@@ -101,17 +101,17 @@ async def backfill_from_bybit(engine: DarwinEngine, rest: BybitRest, n: int) -> 
                 low=lo,
                 close=c,
                 volume=v,
-                buy_volume=v / 2,
-                sell_volume=v / 2,
+                buy_volume=unknown,
+                sell_volume=unknown,
                 n_trades=0,
                 vwap=turnover / v if v > 0 else c,
                 mark_price=c,
-                funding_rate=funding,
-                open_interest=oi,
-                book_imbalance=0.0,
-                spread_bps=0.0,
-                liq_long_notional=0.0,
-                liq_short_notional=0.0,
+                funding_rate=unknown,
+                open_interest=unknown,
+                book_imbalance=unknown,
+                spread_bps=unknown,
+                liq_long_notional=unknown,
+                liq_short_notional=unknown,
                 stale=False,
             )
             for t, o, h, lo, c, v, turnover in rows

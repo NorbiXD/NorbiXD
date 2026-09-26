@@ -8,7 +8,7 @@ _Last updated: 2026-09-26 (session 1)._ Branch: `claude/clever-tesla-kk8pm0`, pu
 * This sandbox's network policy **blocks Bybit, xAI and TypeSafe hosts**: integrations are built to
   the documented protocols and tested against local fakes (fake V5 WebSocket server, httpx
   MockTransport). Nothing has touched the real endpoints yet — first real step: `darwin run --mode paper`.
-* Gates: `.venv/bin/pytest` (263 tests, ~3 min on 4 cores; `-m "not slow"`: 259 in ~1 min) ·
+* Gates: `.venv/bin/pytest` (276 tests, ~3 min on 4 cores; `-m "not slow"`: 272 in ~1 min) ·
   `.venv/bin/ruff check src tests` · `.venv/bin/ruff format --check src tests` · `.venv/bin/mypy` (strict).
 
 ## Status
@@ -42,7 +42,22 @@ _Last updated: 2026-09-26 (session 1)._ Branch: `claude/clever-tesla-kk8pm0`, pu
   allowed unbounded ints; M5 the science criterion also passed on noise. Fixed in 50e2e4b,
   a11f13f and the following commit. Fixing M3 exposed a real Python 3.12 hazard: `gather()` over
   finished tasks no longer yields, so `while tasks: await gather(...)` spun forever.
-* Iteration 4 (final): pending.
+* **Iteration 4 (final, commit bc1c818): 7.3/10, NOT APPROVED.** The review loop is capped at 4
+  iterations, so this is the last independent verdict and it stands. It found one critical and
+  three majors, all introduced or exposed by iteration-3/4 work:
+  C1 a position in a *non-challenge* symbol on the account blocked all trading and crashed the
+  first flatten (KeyError); M-A the warm start held funding/OI at the current value, so the first
+  real change looked like a 15–27σ move (spurious full-conviction trades); M-B `min(p)` gave the
+  DSL a string path into feature arguments (~1 GB allocation); M-C a lost cancel was never
+  re-sent and the order flapped New/UNKNOWN, blocking risk ~77% of the time.
+* **After iteration 4** (commit following bc1c818): C1, M-A, M-B, M-C and the minors (stale-snapshot
+  adoption, sim/fake reduce-only semantics, `--ai` in accelerated sim, graceful Ctrl-C/SIGTERM
+  stop, unreadable registry files, lookback bounds) were fixed with regression tests, and **every
+  reviewer probe script was re-run against the fixed tree and now passes** (P1 lost cancel: 0% of
+  heartbeats blocked vs 77%; P2 warm funding: features NaN, no signal; P3–P5 foreign symbol: no
+  crash, reconciled, flat; P7/P7b DSL escape: rejected by the validator; P8/P9/P9b: flat, no
+  phantom adoption; P6 decision times max 1.7 ms vs 500 ms budget). These fixes have **not** been
+  re-reviewed by an independent QM (loop exhausted) — treat them as self-verified.
 
 ## Findings worth knowing
 * **Default-config 168h replay** (`darwin replay --hours 168`, 1.87M events in 151 s): 42 generations,
@@ -111,6 +126,8 @@ _Last updated: 2026-09-26 (session 1)._ Branch: `claude/clever-tesla-kk8pm0`, pu
 5. Crash-resume (currently: restart = new challenge; preflight refuses a non-flat account).
 
 ## Known limitations
+* No exchange-side catastrophe stops: a killed process or an unreachable venue leaves positions
+  unmanaged. Evolution's edge discovery on the planted market is not proven (see findings).
 * Sim venue passive fills are conservative (trade-through only; no queue model); trade-dump replays
   synthesize the book (optimistic slippage for size).
 * At `sim.speed` > ~600x event re-stamping degrades simulated venue timing (warning logged).

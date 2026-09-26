@@ -38,6 +38,11 @@ class ExecutionGateway(Protocol):
 
     def query_positions(self, account: str, ts: int) -> None: ...
 
+    def query_open_orders(self, account: str, ts: int) -> None:
+        """Report every working order the venue holds for ``account`` (reason
+        ``open_orders_sweep``) and fetch the final state of our open orders it no longer lists."""
+        ...
+
 
 # Legal forward transitions. Anything else is ignored as stale/out-of-order.
 _RANK = {

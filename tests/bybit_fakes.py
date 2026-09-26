@@ -298,6 +298,14 @@ class FakeBybitExchange:
         if a.get("timeInForce") == "PostOnly":
             self.private.put_nowait({"topic": "order", "data": [dict(o)]})  # rests until cancelled
             return {"orderId": oid, "orderLinkId": a["orderLinkId"]}
+        if a.get("reduceOnly"):  # Bybit: never opens or flips; capped at the position size
+            q = self.positions.get(a["symbol"], [0.0, 0.0])[0]
+            if q == 0 or (q > 0) == (a["side"] == "Buy"):
+                o.update(orderStatus="Rejected", rejectReason="EC_ReduceOnlyNotAllowed")
+                self.private.put_nowait({"topic": "order", "data": [dict(o)]})
+                return {"orderId": oid, "orderLinkId": a["orderLinkId"]}
+            qty = min(qty, abs(q))
+            a = {**a, "qty": f"{qty:.10g}"}
         self._apply(a["symbol"], a["side"], qty, px)
         o.update(orderStatus="Filled", cumExecQty=a["qty"], avgPrice=a["price"])
         ex = {

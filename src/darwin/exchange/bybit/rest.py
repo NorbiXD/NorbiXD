@@ -138,13 +138,6 @@ class BybitRest:
         ]
         return sorted(rows)
 
-    async def ticker(self, symbol: str) -> dict[str, Any]:
-        res = await self._request(
-            "GET", "/v5/market/tickers", {"category": "linear", "symbol": symbol}, signed=False
-        )
-        rows = res.get("list", [])
-        return rows[0] if rows else {}
-
     async def server_time_ms(self) -> int:
         res = await self._request("GET", "/v5/market/time", signed=False)
         return int(res["timeNano"]) // 1_000_000 if "timeNano" in res else int(res["timeSecond"]) * 1000

@@ -232,6 +232,8 @@ class FeatureView:
             if len(a.buy) < n:
                 return NAN
             b, s = float(a.buy[-n:].sum()), float(a.sell[-n:].sum())
+            if not (math.isfinite(b) and math.isfinite(s)):
+                return NAN  # unknown flow in the window (warm-start bars): not available
             return (b - s) / (b + s) if b + s > 0 else 0.0
 
         return self._memo(f"flow_imbalance({n})", f)
@@ -252,6 +254,8 @@ class FeatureView:
             if len(fr) < n or n < 3:
                 return NAN
             w = fr[-n:]
+            if not np.isfinite(w).all():
+                return NAN  # unknown funding in the window: never z-score against invented data
             sd = float(np.std(w, ddof=1))
             if sd <= 1e-12:
                 return 0.0
@@ -262,7 +266,7 @@ class FeatureView:
     def oi_change(self, n: int) -> float:
         def f() -> float:
             oi = self.a.oi
-            if len(oi) <= n or oi[-1 - n] <= 0 or oi[-1] <= 0:
+            if len(oi) <= n or not (oi[-1 - n] > 0 and oi[-1] > 0):  # NaN-safe
                 return NAN
             return math.log(oi[-1] / oi[-1 - n])
 
@@ -276,6 +280,8 @@ class FeatureView:
             if len(a.liq_long) < n:
                 return NAN
             lo, sh = float(a.liq_long[-n:].sum()), float(a.liq_short[-n:].sum())
+            if not (math.isfinite(lo) and math.isfinite(sh)):
+                return NAN
             return (sh - lo) / (sh + lo) if sh + lo > 0 else 0.0
 
         return self._memo(f"liq_imbalance({n})", f)
@@ -288,6 +294,8 @@ class FeatureView:
             if len(a.notional) < n:
                 return NAN
             liq = float(a.liq_long[-n:].sum() + a.liq_short[-n:].sum())
+            if not math.isfinite(liq):
+                return NAN
             base = float(np.mean(a.notional[-baseline:])) if len(a.notional) else 0.0
             if base <= 0:
                 return 0.0

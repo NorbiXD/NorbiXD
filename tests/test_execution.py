@@ -305,6 +305,9 @@ def test_order_never_reaches_venue_goes_unknown_then_resolves() -> None:
         def query_positions(self, *a: Any) -> None:
             pass
 
+        def query_open_orders(self, *a: Any) -> None:
+            pass
+
     bh = BlackHole()
     h.exe.gateways["challenge"] = bh  # type: ignore[assignment]
     mo = h.submit(0.5)

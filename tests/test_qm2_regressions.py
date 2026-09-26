@@ -388,6 +388,32 @@ async def test_bybit_candle_backfill_warms_indicators_without_touching_evidence(
     assert view.ready(60) and view.bars[-1].end_ts == forming  # warm now, nothing from the future
     assert eng.bar_index == 0 and not eng.population.books[next(iter(eng.population.books))].equity
     assert eng.ledger["challenge"].cash == eng.cfg.challenge.starting_capital
+    # candles carry OHLCV only: price features are warm, microstructure is *unknown*, not invented
+    import math
+
+    assert math.isfinite(view.zret(30)) and math.isfinite(view.vol(60))
+    for x in (view.funding_z(240), view.flow_imbalance(10), view.liq_imbalance(10), view.oi_change(60)):
+        assert math.isnan(x)
+    # QM iteration 4, M-A: the first live bars with real funding must not look like a 20-sigma move
+    from dataclasses import replace
+
+    last = view.bars[-1]
+    for k, f in enumerate((0.0001, 0.0001001, 0.0001002)):
+        live = replace(
+            last,
+            start_ts=last.end_ts + k * 60_000,
+            end_ts=last.end_ts + (k + 1) * 60_000,
+            buy_volume=3.0,
+            sell_volume=2.0,
+            funding_rate=f,
+            open_interest=12_345.0,
+            liq_long_notional=0.0,
+            liq_short_notional=0.0,
+        )
+        eng.features.add_bar(live)
+    after = eng.features.view("BTCUSDT", last.end_ts + 3 * 60_000)
+    assert math.isnan(after.funding_z(30)) and math.isnan(after.funding_z(240))  # not enough real data
+    assert math.isfinite(after.flow_imbalance(3))  # short windows recover as soon as they are live
 
 
 # ----------------------------------------------------------------------------- QM iteration 3 minors
@@ -470,3 +496,11 @@ def test_store_reports_the_store_error_when_even_dead_lettering_fails(
     with pytest.raises(OperationalError):
         store.flush()
     assert "locked" in (store.last_error or "") and store.pending() >= 1
+
+
+def test_registry_skips_unreadable_records(tmp_path: Any) -> None:
+    from darwin.research.sandbox import SpeciesRegistry
+
+    (tmp_path / "P0000broken.json").write_text("{not json")
+    (tmp_path / "P0000nokey.json").write_text("{}")
+    assert SpeciesRegistry(tmp_path).load(register=True) == []  # skipped, the run goes on

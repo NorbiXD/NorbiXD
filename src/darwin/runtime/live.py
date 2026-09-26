@@ -20,8 +20,9 @@ import heapq
 import itertools
 import logging
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from typing import Any
 
 from darwin.core.events import (
     BookDelta,
@@ -85,6 +86,7 @@ class LiveDriver:
         self.events = 0
         self.restamped = 0
         self.recorder: ParquetRecorder | None = None
+        self.consecutive_errors = 0
 
     # Scheduler protocol (simulated venues) ------------------------------------
     def schedule(self, ts: int, event: Event, target: EventTarget) -> None:
@@ -111,6 +113,16 @@ class LiveDriver:
                 v.on_market(ev)
         self.engine.handle(ev)
         self.events += 1
+
+    def _safely(self, fn: Callable[..., None], *args: Any) -> None:
+        """A live process must outlive a bug in one event: log it, and after repeated failures
+        engage the kill switch so the account is flattened instead of left unmanaged."""
+        try:
+            fn(*args)
+            self.consecutive_errors = 0
+        except Exception as exc:
+            self.consecutive_errors += 1
+            self.engine.engine_error(exc, self.consecutive_errors)
 
     def _run_due(self, now: int) -> None:
         eng = self.engine
@@ -166,11 +178,11 @@ class LiveDriver:
                     item = await asyncio.wait_for(self.queue.get(), timeout=min(timeout, 1.0))
                 now = self.clock.now_ms()
                 with eng.lock:
-                    self._run_due(now)
+                    self._safely(self._run_due, now)
                     if item is not None and not (isinstance(item[0], TimerEvent) and item[0].name == "wake"):
-                        self._dispatch(item[0])
+                        self._safely(self._dispatch, item[0])
                     if now >= next_hb:
-                        eng.handle(TimerEvent(ts=max(now, eng.now), name="heartbeat"))
+                        self._safely(eng.handle, TimerEvent(ts=max(now, eng.now), name="heartbeat"))
                         next_hb = now + self.heartbeat_ms
                 if eng.ended:
                     ended_at = ended_at or now

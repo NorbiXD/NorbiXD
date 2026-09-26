@@ -289,6 +289,8 @@ class ExecutionEngine:
         was_unknown = mo.status is OrderStatus.UNKNOWN
         if not mo.apply_status(ev.status, ev.ts):
             self.stale_updates += 1
+        if ev.status is not OrderStatus.UNKNOWN:
+            mo.queries = 0  # the venue answered definitively: it is alive and knows the order
         if ev.reason:
             mo.reason = ev.reason
         self._maybe_close(mo)
@@ -427,6 +429,15 @@ class ExecutionEngine:
                 mo.last_update_ts = now
                 gw.cancel(mo.account, mo.client_order_id, mo.symbol, now)
                 continue
+            if (
+                mo.cancel_requested_ts is not None
+                and mo.acked_ts is not None
+                and now - mo.cancel_requested_ts >= 2 * self.ack_timeout_ms
+            ):
+                # we asked for a cancel and the order is still working: the cancel (or its
+                # answer) was lost — ask again, at a bounded rate
+                mo.cancel_requested_ts = now
+                gw.cancel(mo.account, mo.client_order_id, mo.symbol, now)
             if mo.acked_ts is None:
                 quiet_limit = self.ack_timeout_ms  # no ACK yet
             elif resting and mo.cancel_requested_ts is None:

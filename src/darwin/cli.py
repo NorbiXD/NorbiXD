@@ -8,6 +8,7 @@ import contextlib
 import json
 import logging
 import os
+import signal
 import socket
 import sys
 import time
@@ -83,6 +84,11 @@ def _check_ai(cfg: ChallengeConfig) -> str | None:
         return None
     if cfg.challenge.mode is Mode.REPLAY:
         return "AI providers are not called in deterministic replay; use --mode sim or paper"
+    if cfg.challenge.mode is Mode.SIM and cfg.sim.speed > 1:
+        return (
+            f"real AI providers run on wall-clock intervals: an accelerated sim ({cfg.sim.speed:g}x) "
+            f"would multiply API calls (and cost) by {cfg.sim.speed:g}; use --speed 1 or --mode paper"
+        )
     missing = [AI_PROVIDERS[n] for n in enabled if not os.environ.get(AI_PROVIDERS[n])]
     if missing:
         return f"AI provider key(s) not set: {', '.join(missing)} (export them or load .env first)"
@@ -127,6 +133,26 @@ async def _serve_api(server: uvicorn.Server) -> None:
         logging.getLogger(__name__).error("API server stopped: %r (trading continues)", e)
 
 
+def _install_stop_handlers(engine: Any) -> None:
+    """First Ctrl-C / SIGTERM: end the challenge now and flatten through the normal path (the
+    driver drains until flat, bounded). A second Ctrl-C exits immediately."""
+    loop = asyncio.get_running_loop()
+    presses = {"n": 0}
+
+    def stop(why: str) -> None:
+        presses["n"] += 1
+        if presses["n"] > 1:
+            print("second interrupt: exiting without waiting for flat", file=sys.stderr)
+            raise SystemExit(130)
+        print(f"{why}: ending the challenge and flattening (Ctrl-C again to exit now)", file=sys.stderr)
+        with engine.lock:
+            engine.stop_early(why)
+
+    for sig, why in ((signal.SIGINT, "interrupt"), (signal.SIGTERM, "terminate")):
+        with contextlib.suppress(NotImplementedError, RuntimeError):  # e.g. Windows
+            loop.add_signal_handler(sig, stop, why)
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     cfg = _config(args)
     problem = _check_ai(cfg)
@@ -155,6 +181,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     async def main() -> float:
         server: uvicorn.Server | None = None
         server_task: asyncio.Task[None] | None = None
+        _install_stop_handlers(rt.engine)
         if not args.no_api:
             app = create_app(rt.engine, rt.webhooks)
             server = uvicorn.Server(

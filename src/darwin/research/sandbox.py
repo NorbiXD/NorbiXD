@@ -224,8 +224,12 @@ class SpeciesRegistry:
         if not self.dir.exists():
             return out
         for path in sorted(self.dir.glob("P*.json")):
-            rec = json.loads(path.read_text())
-            name = rec["primitive"]
+            try:
+                rec = json.loads(path.read_text())
+                name = rec["primitive"]
+            except (OSError, ValueError, KeyError, TypeError) as e:
+                log.warning("registry: %s is unreadable (%s); skipped", path.name, e)
+                continue
             report = rec.get("report") or {}
             stages = report.get("stages") or []
             if not report.get("passed") or not stages or not all(st.get("passed") for st in stages):

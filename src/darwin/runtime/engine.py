@@ -149,6 +149,10 @@ class DarwinEngine:
         self._last_exit_attempt: dict[tuple[str, str, str], int] = {}
         self.venue_positions: dict[str, float] = {}
         self._last_fill_ts: dict[tuple[str, str], int] = {}
+        self.foreign_positions: dict[str, float] = {}
+        self._foreign_orders: set[str] = set()
+        self._venue_pos_ts: dict[str, int] = {}
+        self._foreign_reported: set[str] = set()
         self._mismatches: dict[tuple[str, str], int] = {}
         self._last_flat_query = start_ts - 5_000
         self.last_reconcile_ts = start_ts
@@ -243,12 +247,23 @@ class DarwinEngine:
             ev, (TradeEvent, BookSnapshot, BookDelta, TickerEvent, LiquidationEvent, FundingSettlement)
         ):
             self._on_market(ev)
+        elif isinstance(ev, (FillEvent, FundingPayment, PositionSnapshot)) and (
+            ev.symbol not in self.instruments
+        ):
+            self._on_foreign(ev)
         elif isinstance(ev, FillEvent):
             self._on_fill(ev)
         elif isinstance(ev, OrderUpdate):
             mo = self.execution.on_order_update(ev)
             if mo is not None:
                 self._persist_order(mo)
+            elif ev.reason == "open_orders_sweep" and ev.client_order_id not in self._foreign_orders:
+                # a working order on a challenge symbol that DARWIN did not place
+                self._foreign_orders.add(ev.client_order_id)
+                log.warning("venue holds an order DARWIN did not place: %s %s", ev.symbol, ev.client_order_id)
+                self._system_event(
+                    "foreign_order", {"symbol": ev.symbol, "client_order_id": ev.client_order_id}
+                )
         elif isinstance(ev, FundingPayment):
             residual = self.ledger.on_funding(ev.account, ev.symbol, ev.rate, ev.mark_price, amount=ev.amount)
             self.stats["funding_payments"] += 1
@@ -708,9 +723,10 @@ class DarwinEngine:
             if acct_id not in self.ledger.accounts:
                 continue
             self.execution.cancel_open(acct_id, self.now)
+            # optional clean-ups must never stop the exits below from being sent
             if acct_id == CHALLENGE:
-                self._adopt_venue_residuals()
-            self._cross_internal(acct_id)
+                self._guarded("adopt_venue_residuals", self._adopt_venue_residuals)
+            self._guarded("cross_internal", self._cross_internal, acct_id)
             self._flatten_account(acct_id, reason)
             if (
                 acct_id == CHALLENGE
@@ -732,6 +748,15 @@ class DarwinEngine:
             else:
                 self.flat_confirmed.discard(acct_id)
 
+    def stop_early(self, why: str) -> None:
+        """Operator stop (Ctrl-C, SIGTERM): end the challenge now, which flattens everything
+        through the normal path; the driver then drains until flat (bounded) and exits."""
+        if self.ended:
+            return
+        log.warning("stop requested (%s): ending the challenge and flattening", why)
+        self._system_event("stop_requested", {"why": why})
+        self._end_challenge(self.now)
+
     def enforce_flat(self) -> None:
         """Run one flatten pass now (drivers call this before stopping, so the final state —
         e.g. ``flatten_complete`` — is recorded even if the last fill landed between heartbeats)."""
@@ -741,6 +766,13 @@ class DarwinEngine:
         """True while some account under a flatten condition is not yet flat."""
         return any(a in self.ledger.accounts and not self.is_flat(a) for a, _ in self._flatten_targets())
 
+    def _guarded(self, name: str, fn: Callable[..., None], *args: Any) -> None:
+        try:
+            fn(*args)
+        except Exception as exc:
+            log.exception("flatten step %s failed", name)
+            self._system_event("flatten_step_error", {"step": name, "error": repr(exc)[:300]})
+
     def _adopt_venue_residuals(self) -> None:
         """Under a flatten condition only: a position the venue reports on two consecutive
         snapshots that the ledger does not hold (a manual trade, lost fills) is adopted into a
@@ -748,8 +780,20 @@ class DarwinEngine:
         closes it (with ``reduceOnly``, which can never open or flip a position)."""
         acct = self.ledger[CHALLENGE]
         for sym, venue_qty in sorted(self.venue_positions.items()):
+            if sym not in self.instruments:
+                continue  # never adopt what the challenge does not trade
             key = (CHALLENGE, sym)
             if self._mismatches.get(key, 0) < 2 or self.execution.has_open(CHALLENGE, sym):
+                continue
+            snap_ts = self._venue_pos_ts.get(sym, -(10**15))
+            if self.now - snap_ts > 5_000 or snap_ts <= self._last_fill_ts.get(key, -(10**15)):
+                # only act on a fresh snapshot taken after the last fill: a stale one may show a
+                # position the owner has since closed (it would be "adopted" and chased)
+                if self.now - self._last_flat_query >= 5_000:
+                    self._last_flat_query = self.now
+                    gw = self.gateways.get(CHALLENGE_VENUE)
+                    if gw is not None:
+                        gw.query_positions(CHALLENGE, self.now)
                 continue
             residual = venue_qty - acct.net_qty(sym)
             step = self.instruments[sym].qty_step if sym in self.instruments else 1e-9
@@ -816,6 +860,17 @@ class DarwinEngine:
                     self._on_trade_closed(rt)
             self.stats["internal_crosses"] += 1
             self._system_event("internal_cross", {"account": account, "symbol": sym, "legs": legs})
+
+    def engine_error(self, exc: BaseException, consecutive: int) -> None:
+        """Called by the live driver when handling an event raised. Replay does not isolate
+        errors (a deterministic test must fail loudly); a live account must not be abandoned."""
+        log.error("engine error while handling an event (%d in a row)", consecutive, exc_info=exc)
+        self.stats["engine_errors"] += 1
+        self._system_event("engine_error", {"error": repr(exc)[:300], "consecutive": consecutive})
+        if consecutive >= 3 and not self.governor.kill_switch_active():
+            log.critical("repeated engine errors: engaging the kill switch to flatten the account")
+            self.governor.engage_kill_switch()
+            self._system_event("kill_switch_auto", {"reason": "repeated engine errors"})
 
     def flatten_overdue(self, elapsed_ms: int) -> None:
         """Escalating alert from the live driver: the challenge ended and we are still not flat."""
@@ -1084,6 +1139,7 @@ class DarwinEngine:
         step = self.instruments[ev.symbol].qty_step if ev.symbol in self.instruments else 1e-9
         if ev.account == CHALLENGE:
             self.venue_positions[ev.symbol] = ev.qty
+            self._venue_pos_ts[ev.symbol] = ev.ts
         venue = account_venue(ev.account)
         h = self.health[venue]
         # orders in flight, or a fill in the last few seconds (the snapshot may predate it), make a
@@ -1125,6 +1181,27 @@ class DarwinEngine:
                 self.kill_seen = False
         self._enforce_flat()
 
+    def _on_foreign(self, ev: FillEvent | FundingPayment | PositionSnapshot) -> None:
+        """Activity on the exchange account in a symbol the challenge does not trade (a manual
+        position, another bot): never booked, never reconciled, never adopted or closed by
+        DARWIN — reported once per symbol so the operator knows the account is shared."""
+        sym = ev.symbol
+        if isinstance(ev, PositionSnapshot):
+            step = 1e-12
+            if abs(ev.qty) > step:
+                self.foreign_positions[sym] = ev.qty
+            else:
+                self.foreign_positions.pop(sym, None)
+        self.stats["foreign_events"] += 1
+        if sym not in self._foreign_reported:
+            self._foreign_reported.add(sym)
+            log.warning(
+                "exchange account has activity in %s, outside the challenge symbols: ignored "
+                "(DARWIN never books or closes it; wallet PnL checks pause while it is open)",
+                sym,
+            )
+            self._system_event("foreign_symbol", {"symbol": sym, "event": ev.kind})
+
     def _reconcile_wallet(self, ev: WalletSnapshot) -> None:
         """Compare venue PnL with ledger PnL since the first snapshot (the venue wallet may hold
         more than the challenge capital, so levels are not comparable; changes are)."""
@@ -1135,6 +1212,11 @@ class DarwinEngine:
             return
         if self.execution.has_recent_open(CHALLENGE, self.now):
             return  # fills in flight make a transient difference legitimate (bounded in time)
+        if self.foreign_positions:
+            # positions outside the challenge move the wallet too: the PnL comparison is not
+            # meaningful while they are open (per-symbol position reconciliation still runs)
+            self.venue_equity_base, self.ledger_equity_base = ev.equity, ledger_eq
+            return
         assert self.ledger_equity_base is not None
         drift = (ev.equity - self.venue_equity_base) - (ledger_eq - self.ledger_equity_base)
         tol = max(1.0, 0.02 * self.cfg.challenge.starting_capital)
@@ -1166,6 +1248,7 @@ class DarwinEngine:
             gw = self.gateways.get(CHALLENGE_VENUE)
             if gw is not None:
                 gw.query_positions(CHALLENGE, self.now)
+                gw.query_open_orders(CHALLENGE, self.now)
 
     # ------------------------------------------------------------------ end of challenge
     def _end_challenge(self, ts: int) -> None:

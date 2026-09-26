@@ -32,7 +32,10 @@ allowlist over the AST:
   (``x = True + True`` then ``x = x * x`` forty times would be a 2^40-bit integer) overflows to
   ``inf`` instead of allocating memory; ``math.floor/ceil`` return floats. Inside feature
   arguments (lookbacks) integers stay integers, but no reassignment can happen inside a single
-  expression, so their size is bounded by the node limit. With a bounded node count, execution
+  expression, and every argument passes through a bounded-lookback check (a finite number,
+  clamped to 0..10 000) before any feature sees it. ``p`` may only appear as ``p["key"]`` and
+  ``v``/``math`` only as attribute owners, so no string can reach arithmetic (``min(p)`` would
+  have returned a key). With a bounded node count, execution
   time is bounded too; the engine additionally quarantines any agent whose decision step
   exceeds a time budget. The compiled function runs in a namespace containing
   nothing else and is compiled without inheriting the host's ``__future__`` flags.
@@ -229,6 +232,12 @@ def validate(source: str) -> ParsedSpecies:
         id(n.args[0]) for n in nodes if isinstance(n, ast.Call) and _is_feature_call(n, "signal") and n.args
     }
     param_keys = {id(n.slice) for n in nodes if isinstance(n, ast.Subscript)}
+    # `p` only as p["key"], `v`/`math` only as attribute owners: a bare `p` would let
+    # `min(p)` return a parameter *key* (a string) — QM iteration 4, M-B
+    owners = {id(n.value) for n in nodes if isinstance(n, (ast.Subscript, ast.Attribute))}
+    for node in nodes:
+        if isinstance(node, ast.Name) and node.id in ("p", "v", "math") and id(node) not in owners:
+            raise DSLError(f"line {node.lineno}: {node.id!r} may only be used as p[...] / v.<f> / math.<f>")
     for node in nodes:
         if isinstance(node, ast.Module):
             continue
@@ -314,6 +323,36 @@ def _as_float(node: ast.expr) -> ast.expr:
     return ast.copy_location(ast.Call(func=ast.Name("float", ast.Load()), args=[node], keywords=[]), node)
 
 
+MAX_LOOKBACK = 10_000
+
+
+def _lookback(x: object) -> int:
+    """Every feature-call argument passes through here: a finite real number, clamped to a
+    bounded integer window — whatever arithmetic produced it, a feature can never receive a
+    string, a huge integer or a negative lookback."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
+        raise ValueError(f"feature argument must be a number, got {type(x).__name__}")
+    if isinstance(x, float) and not math.isfinite(x):
+        raise ValueError("feature argument must be finite")
+    return max(0, min(int(x), MAX_LOOKBACK))
+
+
+class _BoundFeatureArgs(ast.NodeTransformer):
+    """Wrap the arguments of ``v.<feature>(...)`` in ``__lookback__(...)`` (the name is not
+    writable from source: names starting with ``_`` are rejected by the validator)."""
+
+    def visit_Call(self, node: ast.Call) -> ast.expr:
+        self.generic_visit(node)
+        if _is_feature_call(node) and not _is_feature_call(node, "signal"):
+            node.args = [
+                ast.copy_location(
+                    ast.Call(func=ast.Name("__lookback__", ast.Load()), args=[a], keywords=[]), a
+                )
+                for a in node.args
+            ]
+        return node
+
+
 class _FloatConstants(ast.NodeTransformer):
     """Outside feature-call arguments: integer constants become floats and every arithmetic
     operand is wrapped in ``float()``, so no body value can grow without bound (bools and
@@ -366,10 +405,15 @@ def compile_score(parsed: ParsedSpecies) -> Callable[[Any, Mapping[str, float]],
     safe = {name: getattr(math, name) for name in MATH_API}
     safe.update(floor=_float_floor, ceil=_float_ceil)
     safe_math = types.SimpleNamespace(**safe)
-    namespace: dict[str, Any] = {"__builtins__": dict(BUILTINS), "math": safe_math}
+    namespace: dict[str, Any] = {
+        "__builtins__": dict(BUILTINS),
+        "math": safe_math,
+        "__lookback__": _lookback,
+    }
     tree = ast.parse(parsed.source)
     fdef = next(n for n in tree.body if isinstance(n, ast.FunctionDef))
-    tree = ast.fix_missing_locations(_FloatConstants(_feature_arg_nodes(fdef)).visit(tree))
+    tree = _FloatConstants(_feature_arg_nodes(fdef)).visit(tree)
+    tree = ast.fix_missing_locations(_BoundFeatureArgs().visit(tree))
     code = compile(tree, "<species>", "exec", dont_inherit=True)
     exec(code, namespace)
     fn = namespace["score"]

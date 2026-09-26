@@ -229,6 +229,8 @@ def test_m2_missing_executions_are_queried_then_reconciled() -> None:
 
         def query_positions(self, *a: Any) -> None: ...
 
+        def query_open_orders(self, *a: Any) -> None: ...
+
     h.exe.gateways["challenge"] = Gw()  # type: ignore[assignment]
     mo = h.submit(0.5)
     h.exe.on_order_update(
