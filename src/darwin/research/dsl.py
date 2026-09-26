@@ -1,0 +1,268 @@
+"""The Level-2 species DSL: a statically-verified subset of Python for generated strategies.
+
+A proposed species is source code of this exact shape::
+
+    DESCRIPTION = "fade funding extremes, but only while volatility is expanding"
+    PARAMS = {"fw": [30, 720, "int"], "z": [0.5, 3.0], "short": [5, 60, "int"], "long": [60, 480, "int"]}
+
+    def score(v, p):
+        fz = v.funding_z(int(p["fw"]))
+        vr = v.vol_ratio(int(p["short"]), int(p["long"]))
+        if not (math.isfinite(fz) and math.isfinite(vr)):
+            return 0.0
+        if vr < 1.2 or abs(fz) < p["z"]:
+            return 0.0
+        return -math.tanh(fz / p["z"])
+
+Why a DSL and not arbitrary Python: a promoted species runs inside the trading process, so the
+*language itself* must make escape impossible, not just a runtime sandbox. The validator is an
+allowlist over the AST:
+
+* no imports, loops, comprehensions, lambdas, try/with, globals, nested defs, star-args, keywords;
+* the only attribute access permitted is ``v.<feature API method>`` and ``math.<function>`` — so
+  no ``__class__``/``__subclasses__`` escapes, no numpy methods like ``ndarray.tofile``;
+* calls only to those attributes or to ``abs/min/max/float/int/round``;
+* subscripts only as ``p["<declared param>"]``; no names starting with ``_``;
+* no ``**`` (``10 ** 10 ** 10`` is a denial of service without any loop); bounded size, so
+  execution time is bounded too. The compiled function runs in a namespace containing nothing else.
+
+``FeatureView`` only exposes past bars, so the feature API is also the leakage boundary.
+"""
+
+from __future__ import annotations
+
+import ast
+import math
+import types
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from typing import Any
+
+from darwin.agents.params import ParamSpec
+
+FEATURE_API = frozenset(
+    {
+        "close",
+        "ret",
+        "vol",
+        "zret",
+        "zprice",
+        "rsi",
+        "channel_position",
+        "atr_pct",
+        "vol_ratio",
+        "flow_imbalance",
+        "book_imbalance",
+        "spread_bps",
+        "funding",
+        "funding_z",
+        "oi_change",
+        "liq_imbalance",
+        "liq_intensity",
+        "signal",
+        "ready",
+    }
+)
+MATH_API = frozenset({"tanh", "exp", "log", "sqrt", "copysign", "fabs", "isfinite", "floor", "ceil", "erf"})
+BUILTINS: dict[str, Callable[..., Any]] = {
+    "abs": abs,
+    "min": min,
+    "max": max,
+    "float": float,
+    "int": int,
+    "round": round,
+}
+RESERVED = frozenset({"v", "p", "math", *BUILTINS})
+MAX_SOURCE_CHARS = 4_000
+MAX_FUNCTION_NODES = 400
+
+_ALLOWED_BODY = (
+    ast.Return,
+    ast.Assign,
+    ast.AugAssign,
+    ast.If,
+    ast.IfExp,
+    ast.Compare,
+    ast.BoolOp,
+    ast.BinOp,
+    ast.UnaryOp,
+    ast.Call,
+    ast.Name,
+    ast.Constant,
+    ast.Subscript,
+    ast.Attribute,
+    ast.Load,
+    ast.Store,
+    ast.And,
+    ast.Or,
+    ast.Not,
+    ast.USub,
+    ast.UAdd,
+    ast.Add,
+    ast.Sub,
+    ast.Mult,
+    ast.Div,
+    ast.FloorDiv,
+    ast.Mod,
+    ast.Eq,
+    ast.NotEq,
+    ast.Lt,
+    ast.LtE,
+    ast.Gt,
+    ast.GtE,
+    ast.Pass,
+)
+
+
+class DSLError(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class ParsedSpecies:
+    description: str
+    params: dict[str, ParamSpec]
+    source: str
+
+
+def _literal(node: ast.expr) -> Any:
+    try:
+        return ast.literal_eval(node)
+    except ValueError as e:
+        raise DSLError(f"line {node.lineno}: expected a literal") from e
+
+
+def _parse_params(node: ast.expr) -> dict[str, ParamSpec]:
+    raw = _literal(node)
+    if not isinstance(raw, dict) or not raw or len(raw) > 8:
+        raise DSLError("PARAMS must be a dict of 1..8 entries")
+    out: dict[str, ParamSpec] = {}
+    for name, spec in raw.items():
+        if not isinstance(name, str) or not name.isidentifier() or name.startswith("_"):
+            raise DSLError(f"bad param name {name!r}")
+        if not isinstance(spec, (list, tuple)) or len(spec) not in (2, 3):
+            raise DSLError(f"param {name}: expected [low, high] or [low, high, kind]")
+        low, high = float(spec[0]), float(spec[1])
+        kind = spec[2] if len(spec) == 3 else "float"
+        if kind not in ("float", "int", "log"):
+            raise DSLError(f"param {name}: kind must be float|int|log")
+        if not (math.isfinite(low) and math.isfinite(high)) or high <= low:
+            raise DSLError(f"param {name}: need finite low < high")
+        if kind == "log":
+            out[name] = ParamSpec(low, high, "float", log=True)
+        elif kind == "int":
+            out[name] = ParamSpec(low, high, "int", log=low > 0 and high / max(low, 1e-9) > 20)
+        else:
+            out[name] = ParamSpec(low, high)
+    return out
+
+
+def validate(source: str) -> ParsedSpecies:
+    """Statically verify a proposal; raises :class:`DSLError` with the first violation."""
+    if len(source) > MAX_SOURCE_CHARS:
+        raise DSLError("source too long")
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as e:
+        raise DSLError(f"syntax error: {e}") from e
+    description = ""
+    params: dict[str, ParamSpec] | None = None
+    fn: ast.FunctionDef | None = None
+    for stmt in tree.body:
+        if (
+            isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Constant)
+            and isinstance(stmt.value.value, str)
+        ):
+            continue  # docstring
+        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+            target = stmt.targets[0].id
+            if target == "DESCRIPTION":
+                d = _literal(stmt.value)
+                if not isinstance(d, str):
+                    raise DSLError("DESCRIPTION must be a string")
+                description = d[:500]
+                continue
+            if target == "PARAMS":
+                params = _parse_params(stmt.value)
+                continue
+        if isinstance(stmt, ast.FunctionDef) and stmt.name == "score" and fn is None:
+            fn = stmt
+            continue
+        raise DSLError(
+            f"line {getattr(stmt, 'lineno', '?')}: only DESCRIPTION, PARAMS and def score(v, p) allowed"
+        )
+    if fn is None or params is None:
+        raise DSLError("need PARAMS and def score(v, p)")
+    a = fn.args
+    if (
+        [x.arg for x in a.args] != ["v", "p"]
+        or a.vararg
+        or a.kwarg
+        or a.kwonlyargs
+        or a.defaults
+        or a.posonlyargs
+        or fn.decorator_list
+        or fn.returns
+    ):
+        raise DSLError("signature must be exactly: def score(v, p)")
+    nodes = list(ast.walk(ast.Module(body=fn.body, type_ignores=[])))
+    if len(nodes) > MAX_FUNCTION_NODES:
+        raise DSLError("function too large")
+    for node in nodes:
+        if isinstance(node, ast.Module):
+            continue
+        if not isinstance(node, _ALLOWED_BODY):
+            raise DSLError(f"line {getattr(node, 'lineno', '?')}: {type(node).__name__} not allowed")
+        if isinstance(node, ast.Name):
+            if node.id.startswith("_"):
+                raise DSLError(f"name {node.id!r} not allowed")
+            if isinstance(node.ctx, ast.Store) and node.id in RESERVED:
+                raise DSLError(f"cannot assign to {node.id!r}")
+        elif isinstance(node, ast.Attribute):
+            if not isinstance(node.value, ast.Name) or isinstance(node.ctx, ast.Store):
+                raise DSLError(f"line {node.lineno}: attribute access only as v.<feature> or math.<fn>")
+            owner, attr = node.value.id, node.attr
+            if not ((owner == "v" and attr in FEATURE_API) or (owner == "math" and attr in MATH_API)):
+                raise DSLError(f"line {node.lineno}: {owner}.{attr} is not in the allowed API")
+        elif isinstance(node, ast.Call):
+            if node.keywords:
+                raise DSLError(f"line {node.lineno}: keyword arguments not allowed")
+            f = node.func
+            if isinstance(f, ast.Name):
+                if f.id not in BUILTINS:
+                    raise DSLError(f"line {node.lineno}: call to {f.id!r} not allowed")
+            elif not isinstance(f, ast.Attribute):
+                raise DSLError(f"line {node.lineno}: only v.<feature>(...), math.<fn>(...) or builtins")
+            if any(isinstance(arg, ast.Starred) for arg in node.args):
+                raise DSLError("star-args not allowed")
+        elif isinstance(node, ast.Subscript):
+            if not (isinstance(node.value, ast.Name) and node.value.id == "p"):
+                raise DSLError(f'line {node.lineno}: subscripts only as p["name"]')
+            sl = node.slice
+            if not (isinstance(sl, ast.Constant) and isinstance(sl.value, str) and sl.value in params):
+                raise DSLError(f"line {node.lineno}: unknown parameter subscript")
+            if isinstance(node.ctx, ast.Store):
+                raise DSLError("cannot assign into p")
+        elif isinstance(node, ast.Constant):
+            if not isinstance(node.value, (int, float, bool, str, type(None))):
+                raise DSLError("unsupported constant")
+            if (
+                isinstance(node.value, (int, float))
+                and not isinstance(node.value, bool)
+                and abs(node.value) > 1e9
+            ):
+                raise DSLError("numeric constant too large")
+    return ParsedSpecies(description=description, params=params, source=source)
+
+
+def compile_score(parsed: ParsedSpecies) -> Callable[[Any, Mapping[str, float]], float]:
+    """Compile a *validated* proposal into ``score(v, p)`` with an empty-by-default namespace."""
+    safe_math = types.SimpleNamespace(**{name: getattr(math, name) for name in MATH_API})
+    namespace: dict[str, Any] = {"__builtins__": dict(BUILTINS), "math": safe_math}
+    code = compile(parsed.source, "<species>", "exec")
+    exec(code, namespace)
+    fn = namespace["score"]
+    if not callable(fn):
+        raise DSLError("score is not callable")
+    return fn  # type: ignore[no-any-return]

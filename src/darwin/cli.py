@@ -25,6 +25,8 @@ from darwin.evolution.tournament import load_champions, run_tournament
 from darwin.market.synthetic import SyntheticMarket
 from darwin.persistence.store import AuditStore
 from darwin.replay.recorder import load_events
+from darwin.research.proposer import TemplateProposer
+from darwin.research.sandbox import SandboxSettings, SpeciesRegistry, evaluate_proposal
 from darwin.runtime.app import build_runtime, prepare_config, synthetic_stream
 from darwin.runtime.replay import build_replay
 
@@ -105,7 +107,12 @@ def cmd_run(args: argparse.Namespace) -> int:
     seeds = load_champions(args.seed_genomes, min_holdout_fitness=0.0) if args.seed_genomes else None
     if seeds is not None:
         print(f"seeding {len(seeds)} champion genomes from {args.seed_genomes}")
+    promoted = SpeciesRegistry(args.species_dir).load(register=True)
     rt = build_runtime(cfg, store, run_id, seed_genomes=seeds)
+    for prim, genome in promoted:
+        if genome is not None:
+            a = rt.engine.inject_genome(genome, origin=f"sandbox:{prim}")
+            print(f"injected promoted species {prim} as challenger {a.agent_id}")
     logging.getLogger(__name__).info(
         "run %s mode=%s db=%s", run_id, cfg.challenge.mode.value, cfg.persistence.database_url
     )
@@ -240,6 +247,31 @@ def cmd_bench(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_research(args: argparse.Namespace) -> int:
+    registry = SpeciesRegistry(args.registry)
+    proposals = TemplateProposer(seed=args.seed or 0).propose(args.proposals)
+    settings = SandboxSettings(
+        train_hours=args.train_hours,
+        holdout_hours=args.holdout_hours,
+        genomes=args.genomes,
+        seed=args.seed or 7,
+    )
+    for prop in proposals:
+        print(f"\n{prop.proposal_id} [{prop.proposer}] {prop.rationale}")
+        rep = evaluate_proposal(prop, settings)
+        for st in rep.stages:
+            print(
+                f"  {'PASS' if st.passed else 'FAIL'} {st.stage:10} "
+                f"{json.dumps(st.detail, default=str)[:160]}"
+            )
+        if rep.error:
+            print(f"  error: {rep.error[:300]}")
+        if rep.passed:
+            path = registry.save(prop, rep)
+            print(f"  PROMOTED -> {path}")
+    return 0
+
+
 def cmd_explain(args: argparse.Namespace) -> int:
     cfg = _config(args)
     store = AuditStore(cfg.persistence.database_url, run_id=args.run or "?")
@@ -331,6 +363,7 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--no-api", action="store_true")
     r.add_argument("--keep-api", action="store_true", help="keep serving the dashboard after the end")
     r.add_argument("--seed-genomes", help="champion set JSON from `darwin evolve`")
+    r.add_argument("--species-dir", default="./data/species", help="promoted Level-2 species to inject")
     r.set_defaults(fn=cmd_run)
 
     rp = sub.add_parser("replay", help="fast deterministic replay on synthetic data")
@@ -340,6 +373,15 @@ def main(argv: list[str] | None = None) -> int:
     rp.add_argument("--null-market", action="store_true", help="random walk without planted structure")
     rp.add_argument("--no-db", action="store_true")
     rp.set_defaults(fn=cmd_replay)
+
+    rs2 = sub.add_parser("research", help="Level-2: propose new species, sandbox-validate, promote")
+    rs2.add_argument("--proposals", type=int, default=2)
+    rs2.add_argument("--train-hours", type=float, default=36)
+    rs2.add_argument("--holdout-hours", type=float, default=12)
+    rs2.add_argument("--genomes", type=int, default=6)
+    rs2.add_argument("--seed", type=int)
+    rs2.add_argument("--registry", default="./data/species")
+    rs2.set_defaults(fn=cmd_research)
 
     ev = sub.add_parser("evolve", help="offline accelerated evolution: train -> holdout -> champion set")
     ev.add_argument("--train-hours", type=float, default=72)

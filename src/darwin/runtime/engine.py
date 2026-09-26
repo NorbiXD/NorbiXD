@@ -188,6 +188,13 @@ class DarwinEngine:
             self._on_birth(agent)
         self._persist_lineage(self.population.drain_lineage())
 
+    def inject_genome(self, genome: Genome, origin: str) -> Agent:
+        """Add an externally proposed genome (e.g. a promoted Level-2 species) as a challenger."""
+        agent = self.population.inject(genome, self.now, origin)
+        self._on_birth(agent)
+        self._persist_lineage(self.population.drain_lineage())
+        return agent
+
     def _on_birth(self, agent: Agent) -> None:
         acct = shadow_account(agent.agent_id)
         eval_cap = self.cfg.evolution.eval_capital

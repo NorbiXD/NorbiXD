@@ -34,8 +34,18 @@ uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -e ".[de
 # 4. Paper trading on Bybit's real public streams (no keys needed)
 .venv/bin/darwin run --mode paper
 
-# 5. Testnet (needs BYBIT_TESTNET_API_KEY / _SECRET)
+# 5. Testnet (needs BYBIT_TESTNET_API_KEY / _SECRET; refuses a non-flat account)
 .venv/bin/darwin run --mode testnet
+
+# 6. Offline accelerated evolution -> champion set -> seed a live population
+.venv/bin/darwin evolve --train-hours 72 --holdout-hours 24 --out champions.json
+.venv/bin/darwin run --mode sim --seed-genomes champions.json
+
+# 7. Allocator benchmark (paired, identical populations per seed)
+.venv/bin/darwin bench-allocators --seeds 6 --hours 48
+
+# 8. Level-2: propose new species, sandbox-validate, promote (injected on the next run)
+.venv/bin/darwin research --proposals 2
 ```
 
 Docker (PostgreSQL + DARWIN in sim mode):
@@ -59,7 +69,8 @@ docker compose up --build
 ## Development
 
 ```bash
-.venv/bin/pytest            # ~110 tests, incl. look-ahead perturbation and end-to-end evolution
+.venv/bin/pytest            # ~220 tests: look-ahead perturbation, e2e evolution, known-answer science,
+                            # chaos, governor property tests (-m "not slow" skips the long ones)
 .venv/bin/ruff check src tests && .venv/bin/ruff format --check src tests
 .venv/bin/mypy              # strict
 ```
@@ -78,11 +89,16 @@ docker compose up --build
 | `src/darwin/exchange/sim` | simulated venue (latency, book walking, fees, funding, liquidation, chaos) |
 | `src/darwin/exchange/bybit` | Bybit V5 parser, WebSocket client, REST, execution gateway, feeds |
 | `src/darwin/portfolio` | ledger, agent sub-positions, round trips (MFE/MAE) |
-| `src/darwin/evolution` | fitness, population/selection/lineage, capital allocators |
+| `src/darwin/evolution` | fitness, population/selection/lineage, allocators, tournament, benchmark |
 | `src/darwin/runtime` | engine, replay driver, live driver, mode wiring |
 | `src/darwin/persistence` | SQL schema + buffered audit store |
 | `src/darwin/attribution` | decision reconstruction ("explain") |
 | `src/darwin/api` | FastAPI observability/control API |
+| `src/darwin/dashboard` | single-file live dashboard served at `/` |
+| `src/darwin/intelligence` | Jev / Grok / mock providers, fast+slow path service |
+| `src/darwin/signals` | point-in-time signal board, external (webhook) feeds |
+| `src/darwin/replay` | Parquet recorder, DuckDB loader, Bybit trade-dump loader |
+| `src/darwin/research` | Level-2 species DSL, sandbox pipeline, proposers, registry |
 
 **Disclaimer:** experimental research software. The synthetic market validates the machinery and
 says nothing about real-market profitability. Don't trade money you can't lose.
