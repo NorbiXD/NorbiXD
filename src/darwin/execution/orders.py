@@ -75,6 +75,7 @@ class ManagedOrder:
     acked_ts: int | None = None
     last_update_ts: int = 0
     queries: int = 0
+    cancel_requested_ts: int | None = None
     reason: str = ""
     exec_ids: list[str] = field(default_factory=list)
 

@@ -81,6 +81,17 @@ class ExecutionEngine:
             return 0.0
         return sum(self.orders[i].signed_remaining for i in ids)
 
+    def pending_split(self, account: str, agent_id: str, symbol: str) -> tuple[float, float]:
+        """Signed in-flight quantity split into (risk-increasing, risk-reducing) orders."""
+        inc = red = 0.0
+        for i in self._open_by_key.get((account, agent_id, symbol), ()):
+            o = self.orders[i]
+            if o.risk_increasing:
+                inc += o.signed_remaining
+            else:
+                red += o.signed_remaining
+        return inc, red
+
     def open_orders(self) -> list[ManagedOrder]:
         return [self.orders[i] for i in sorted(self._open_ids)]
 
@@ -102,6 +113,9 @@ class ExecutionEngine:
         return any(
             self.orders[i].account == account and self.orders[i].symbol == symbol for i in self._open_ids
         )
+
+    def has_open_account(self, account: str) -> bool:
+        return any(self.orders[i].account == account for i in self._open_ids)
 
     # ------------------------------------------------------------------ submission
     def _next_id(self, account: str, agent_id: str) -> str:
@@ -128,9 +142,16 @@ class ExecutionEngine:
             # marketable limit (IOC) with an explicit slippage cap: a "market" order that can
             # never fill at an absurd price on a thin or stale book
             slip = intent.max_slippage_bps / 1e4
+            base = ref
             if not decision.risk_increasing:
-                slip = max(slip, 0.02)  # exits: favour certainty of execution
-            price = ref * (1 + slip) if side is Side.BUY else ref * (1 - slip)
+                # exits favour certainty of execution: a wider cap, anchored on the worse of the
+                # reference price and the executable touch, so a book that gapped away from a
+                # lagging mark cannot leave a stop unfillable
+                slip = max(slip, 0.02)
+                touch = st.book.best_ask() if side is Side.BUY else st.book.best_bid()
+                if touch and st.book.valid:
+                    base = max(ref, touch) if side is Side.BUY else min(ref, touch)
+            price = base * (1 + slip) if side is Side.BUY else base * (1 - slip)
             tif = TimeInForce.IOC
         if price is None or price <= 0:
             log.warning("no price for %s order; skipping", decision.symbol)
@@ -173,6 +194,37 @@ class ExecutionEngine:
         self._open_ids.add(req.client_order_id)
         gw.submit(req)
         return mo
+
+    def cancel_open(
+        self,
+        account: str,
+        now: int,
+        agent_id: str | None = None,
+        symbol: str | None = None,
+        increasing_only: bool = True,
+    ) -> int:
+        """Request cancellation of working orders (kill switch, breakers, exits).
+
+        Cancels are re-sent at most once per ACK timeout while the order stays working, so a
+        lost cancel is retried without flooding the venue. Returns the number of requests sent.
+        """
+        sent = 0
+        for cid in sorted(self._open_ids):
+            o = self.orders[cid]
+            if o.account != account or o.status.terminal:
+                continue
+            if agent_id is not None and o.agent_id != agent_id:
+                continue
+            if symbol is not None and o.symbol != symbol:
+                continue
+            if increasing_only and not o.risk_increasing:
+                continue
+            if o.cancel_requested_ts is not None and now - o.cancel_requested_ts < self.ack_timeout_ms:
+                continue
+            o.cancel_requested_ts = now
+            self.gateways[self.account_venue(account)].cancel(account, cid, o.symbol, now)
+            sent += 1
+        return sent
 
     def set_tick_sizes(self, ticks: dict[str, float]) -> None:
         self._tick = dict(ticks)

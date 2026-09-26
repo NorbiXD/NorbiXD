@@ -135,7 +135,12 @@ class DarwinEngine:
         self.ledger.open_account(CHALLENGE, "challenge", ch.starting_capital)
         self.last_bars: dict[str, Bar] = {}
         self.marks: dict[str, float] = {}
-        self.kill_flattened = False
+        self.kill_seen = False
+        #: accounts confirmed flat (ledger, venue and orders) while a flatten condition holds
+        self.flat_confirmed: set[str] = set()
+        self._last_exit_attempt: dict[tuple[str, str, str], int] = {}
+        self.venue_positions: dict[str, float] = {}
+        self._last_flat_query = start_ts - 5_000
         self.last_reconcile_ts = start_ts
         self._last_prune = start_ts
         self.observers: list[BarObserver] = []
@@ -421,6 +426,7 @@ class DarwinEngine:
             return
 
         self._safety_check(chal.last_equity)
+        self._sync_challenge_book()
         self.ledger.closed_trades.clear()  # consumed via on_fill's return value
 
         evolved = False
@@ -464,6 +470,12 @@ class DarwinEngine:
             st = self.market[intent.symbol]
             marks = self._marks()
             pending = self.execution.pending_qty(acct_id, aid, intent.symbol)
+            if intent.is_system and intent.target_exposure == 0:
+                # getting flat must not wait for a working entry: cancel it and exit what is
+                # filled now; anything that fills before the cancel lands is exited next pass
+                inc, pending = self.execution.pending_split(acct_id, aid, intent.symbol)
+                if inc:
+                    self.execution.cancel_open(acct_id, self.now, aid, intent.symbol)
             decision = self.governor.evaluate(
                 intent,
                 acct,
@@ -522,8 +534,8 @@ class DarwinEngine:
         for (acct_id, aid, sym), rt in list(self.ledger.open_trades.items()):
             if sym != symbol or rt.entry_price <= 0:
                 continue
-            if self.execution.pending_qty(acct_id, aid, sym) != 0:
-                continue
+            if self.execution.pending_split(acct_id, aid, sym)[1] != 0:
+                continue  # an exit is already in flight
             reason: IntentReason | None = None
             move = (price / rt.entry_price - 1) * rt.direction
             if rt.stop_loss_pct is not None and move <= -rt.stop_loss_pct:
@@ -532,7 +544,7 @@ class DarwinEngine:
                 reason = "take_profit"
             elif rt.max_hold_ms is not None and self.now - rt.entry_ts >= rt.max_hold_ms:
                 reason = "max_hold"
-            if reason is None:
+            if reason is None or not self._exit_due(acct_id, aid, sym):
                 continue
             self._system_exit(acct_id, aid, sym, reason, rt.entry_intent_id)
             agent = self.population.agents.get(aid)
@@ -557,11 +569,113 @@ class DarwinEngine:
         )
         self._route(intent, only=account)
 
+    def _exit_due(self, account: str, agent_id: str, symbol: str, retry_ms: int = 1_000) -> bool:
+        """May a protective exit be (re)issued now? Not while an exit order is in flight, and at
+        most once per ``retry_ms`` per sub-position, so a rejecting venue is retried at a bounded
+        rate instead of on every tick."""
+        if self.execution.pending_split(account, agent_id, symbol)[1] != 0:
+            return False
+        key = (account, agent_id, symbol)
+        last = self._last_exit_attempt.get(key)
+        if last is not None and self.now - last < retry_ms:
+            return False
+        self._last_exit_attempt[key] = self.now
+        return True
+
     def _flatten_account(self, account: str, reason: IntentReason) -> None:
         acct = self.ledger[account]
         for aid, sym, _p in acct.open_positions():
-            if self.execution.pending_qty(account, aid, sym) == 0:
+            if self._exit_due(account, aid, sym):
                 self._system_exit(account, aid, sym, reason, None)
+
+    def _flatten_targets(self) -> list[tuple[str, IntentReason]]:
+        """Accounts that must be driven flat right now, and why."""
+        if self.ended:
+            if not self.cfg.challenge.flatten_at_end:
+                return []
+            return [(a, "challenge_end") for a in sorted(self.ledger.accounts)]
+        if self.governor.kill_switch_active():
+            return [(CHALLENGE, "kill_switch")]
+        if self.cfg.risk.flatten_on_breaker and self.governor.breaker(CHALLENGE):
+            return [(CHALLENGE, "circuit_breaker")]
+        return []
+
+    def is_flat(self, account: str) -> bool:
+        """No ledger position, no working order and (challenge) no venue-reported position."""
+        if self.ledger[account].open_positions() or self.execution.has_open_account(account):
+            return False
+        if account == CHALLENGE:
+            return all(
+                abs(q) <= (self.instruments[s].qty_step if s in self.instruments else 1e-9) / 2
+                for s, q in self.venue_positions.items()
+            )
+        return True
+
+    def _enforce_flat(self) -> None:
+        """Flatten until flat. Runs on every heartbeat and bar close while a kill switch,
+        breaker or challenge end is in force: cancels working risk-increasing orders and
+        re-issues exits for every open sub-position (rejects, partial fills and UNKNOWN orders
+        are retried) until the account is confirmed flat."""
+        targets = self._flatten_targets()
+        self.flat_confirmed &= {a for a, _ in targets}
+        for acct_id, reason in targets:
+            if acct_id not in self.ledger.accounts:
+                continue
+            self.execution.cancel_open(acct_id, self.now)
+            self._flatten_account(acct_id, reason)
+            if (
+                acct_id == CHALLENGE
+                and not self.ledger[acct_id].open_positions()
+                and not self.execution.has_open_account(acct_id)
+                and not self.is_flat(acct_id)
+                and self.now - self._last_flat_query >= 5_000
+            ):
+                # the ledger is flat but the venue last reported a position: ask again
+                self._last_flat_query = self.now
+                gw = self.gateways.get(CHALLENGE_VENUE)
+                if gw is not None:
+                    gw.query_positions(CHALLENGE, self.now)
+            if self.is_flat(acct_id):
+                if acct_id not in self.flat_confirmed:
+                    self.flat_confirmed.add(acct_id)
+                    if acct_id == CHALLENGE:
+                        self._system_event("flatten_complete", {"reason": reason})
+            else:
+                self.flat_confirmed.discard(acct_id)
+
+    def flatten_pending(self) -> bool:
+        """True while some account under a flatten condition is not yet flat."""
+        return any(a in self.ledger.accounts and not self.is_flat(a) for a, _ in self._flatten_targets())
+
+    def flatten_incomplete(self) -> None:
+        """Drivers call this when they stop with a flatten condition still unmet."""
+        left = {
+            a: [(aid, sym, p.qty) for aid, sym, p in self.ledger[a].open_positions()]
+            for a, _ in self._flatten_targets()
+            if a in self.ledger.accounts and not self.is_flat(a)
+        }
+        log.error("stopping with accounts not flat: %s venue=%s", left, self.venue_positions)
+        self._system_event("flatten_incomplete", {"open": left, "venue": dict(self.venue_positions)})
+
+    def _sync_challenge_book(self) -> None:
+        """The challenge book mirrors shadow books. If an exit filled in the shadow but not in
+        the challenge (reject, stop hit at a different entry, lost fill), close the leftover."""
+        chal = self.ledger[CHALLENGE]
+        for aid, sym, pos in chal.open_positions():
+            agent = self.population.agents.get(aid)
+            reason: IntentReason
+            if agent is None or not agent.alive:
+                reason = "agent_killed"
+            elif self.weights.get(aid, 0.0) <= 0:
+                reason = "defunded"
+            else:
+                sq = self.ledger[shadow_account(aid)].agent_qty(aid, sym)
+                if sq != 0 and (sq > 0) == (pos.qty > 0):
+                    continue
+                reason = "desync_exit"
+            if self._exit_due(CHALLENGE, aid, sym):
+                self.stats[f"sync:{reason}"] += 1
+                self._system_exit(CHALLENGE, aid, sym, reason, None)
 
     # ------------------------------------------------------------------ evolution / capital
     def _evolve(self, ts: int) -> None:
@@ -579,7 +693,7 @@ class DarwinEngine:
             for acct_id in (shadow_account(agent.agent_id), CHALLENGE):
                 acct = self.ledger[acct_id]
                 for aid, sym, _p in acct.open_positions():
-                    if aid == agent.agent_id and self.execution.pending_qty(acct_id, aid, sym) == 0:
+                    if aid == agent.agent_id and self._exit_due(acct_id, aid, sym):
                         self._system_exit(acct_id, aid, sym, "agent_killed", None)
             self.weights.pop(agent.agent_id, None)
         for agent in res.demoted + res.reinstated:
@@ -632,7 +746,7 @@ class DarwinEngine:
             if nw == 0 and ow > 0:
                 self._lineage_event(ts, agent, LineageEventKind.DEFUNDED, {"weight": ow})
                 for a2, sym, _p in chal.open_positions():
-                    if a2 == aid and self.execution.pending_qty(CHALLENGE, aid, sym) == 0:
+                    if a2 == aid and self._exit_due(CHALLENGE, aid, sym):
                         self._system_exit(CHALLENGE, aid, sym, "defunded", None)
             elif nw > 0 and (ow == 0 or abs(nw - ow) / max(ow, 1e-9) > 0.2):
                 if ow == 0:
@@ -776,6 +890,8 @@ class DarwinEngine:
             return
         internal = self.ledger[ev.account].net_qty(ev.symbol)
         step = self.instruments[ev.symbol].qty_step if ev.symbol in self.instruments else 1e-9
+        if ev.account == CHALLENGE:
+            self.venue_positions[ev.symbol] = ev.qty
         venue = account_venue(ev.account)
         h = self.health[venue]
         # orders in flight make a transient mismatch legitimate
@@ -795,22 +911,19 @@ class DarwinEngine:
 
     def _safety_check(self, equity: float) -> None:
         """Breakers and kill switch. Runs at every bar close *and* every heartbeat, so a trip
-        or a touched KILL file acts within a heartbeat, not a bar."""
-        if self.ended:
-            return
-        chal = self.ledger[CHALLENGE]
-        trip = self.governor.check_breakers(chal, equity)
-        if trip:
-            self._system_event("circuit_breaker", {"reason": trip, "equity": equity})
-            if self.cfg.risk.flatten_on_breaker:
-                self._flatten_account(CHALLENGE, "circuit_breaker")
-        if self.governor.kill_switch_active():
-            if not self.kill_flattened:
-                self._system_event("kill_switch", {"equity": equity})
-                self._flatten_account(CHALLENGE, "kill_switch")
-                self.kill_flattened = True
-        else:
-            self.kill_flattened = False
+        or a touched KILL file acts within a heartbeat, not a bar, and flattening is retried on
+        every heartbeat until the account is actually flat."""
+        if not self.ended:
+            trip = self.governor.check_breakers(self.ledger[CHALLENGE], equity)
+            if trip:
+                self._system_event("circuit_breaker", {"reason": trip, "equity": equity})
+            if self.governor.kill_switch_active():
+                if not self.kill_seen:
+                    self._system_event("kill_switch", {"equity": equity})
+                    self.kill_seen = True
+            else:
+                self.kill_seen = False
+        self._enforce_flat()
 
     def _reconcile_wallet(self, ev: WalletSnapshot) -> None:
         """Compare venue PnL with ledger PnL since the first snapshot (the venue wallet may hold
@@ -842,6 +955,9 @@ class DarwinEngine:
         self.execution.check_timeouts(self.now)
         if self.marks:
             self._safety_check(self.ledger[CHALLENGE].equity(self._marks()))
+        if len(self._last_exit_attempt) > 10_000:
+            cutoff = self.now - 60_000
+            self._last_exit_attempt = {k: t for k, t in self._last_exit_attempt.items() if t > cutoff}
         if self.now - self._last_prune >= 600_000:
             self._last_prune = self.now
             self.execution.prune(self.now)
@@ -857,9 +973,7 @@ class DarwinEngine:
             return
         self.ended = True
         self._system_event("challenge_end", {"equity": self.ledger[CHALLENGE].last_equity})
-        if self.cfg.challenge.flatten_at_end:
-            for acct_id in list(self.ledger.accounts):
-                self._flatten_account(acct_id, "challenge_end")
+        self._enforce_flat()
 
     def finalize(self) -> float:
         """Compute the public score after the driver has drained all in-flight events."""

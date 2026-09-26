@@ -173,8 +173,15 @@ class LiveDriver:
                         next_hb = now + self.heartbeat_ms
                 if eng.ended:
                     ended_at = ended_at or now
-                    in_flight = bool(eng.execution.open_orders()) or bool(self._heap)
-                    if not in_flight or now - ended_at > self.drain_timeout_ms:
+                    with eng.lock:
+                        in_flight = (
+                            bool(eng.execution.open_orders()) or bool(self._heap) or eng.flatten_pending()
+                        )
+                    if not in_flight:
+                        break
+                    if now - ended_at > self.drain_timeout_ms:
+                        with eng.lock:
+                            eng.flatten_incomplete()
                         break
         finally:
             self.stop.set()

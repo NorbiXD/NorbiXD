@@ -82,9 +82,9 @@
   @media (max-width: 600px) { header, main { padding-left: 16px; padding-right: 16px; } }
   .tile .label { font-size: 12px; color: var(--text-secondary); }
   .tile .value { font-size: 24px; font-weight: 600; margin-top: 2px; }
-  .tile .delta { font-size: 12px; margin-top: 2px; }
+  .tile .delta { font-size: 12px; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .hero .value { font-size: clamp(36px, 8vw, 52px); line-height: 1.05; font-weight: 600; }
-  td.sp { max-width: 190px; overflow: hidden; text-overflow: ellipsis; }
+  td.sp { max-width: 140px; overflow: hidden; text-overflow: ellipsis; }
   .up { color: var(--up-text); } .down { color: var(--down-text); } .muted { color: var(--text-muted); }
   .status { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; }
   .status .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
@@ -96,8 +96,8 @@
   .tooltip .tv { font-weight: 600; color: var(--text-primary); font-size: 13px; }
   .tooltip .tl { color: var(--text-secondary); }
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
-  th { text-align: left; font-weight: 600; color: var(--text-secondary); border-bottom: 1px solid var(--grid); padding: 6px 8px; white-space: nowrap; }
-  td { border-bottom: 1px solid var(--grid); padding: 5px 8px; white-space: nowrap; }
+  th { text-align: left; font-weight: 600; color: var(--text-secondary); border-bottom: 1px solid var(--grid); padding: 6px 6px; white-space: nowrap; }
+  td { border-bottom: 1px solid var(--grid); padding: 5px 6px; white-space: nowrap; }
   td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   tr.dead td { color: var(--text-muted); }
   .scroll { max-height: 420px; overflow: auto; }

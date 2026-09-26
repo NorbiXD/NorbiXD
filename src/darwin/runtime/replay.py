@@ -39,8 +39,10 @@ class ReplayDriver:
         venues: list[SimExchange],
         timer_ms: int = 5_000,
         flush_every: int = 20_000,
+        drain_ms: int = 900_000,
     ) -> None:
         self.engine = engine
+        self.drain_ms = drain_ms
         self.market: Iterator[Event] = iter(market)
         self.venues = venues
         self.timer_ms = timer_ms
@@ -96,18 +98,25 @@ class ReplayDriver:
             if store is not None and self.events % self.flush_every == 0:
                 store.flush()
         # end of stream: close the final bars (triggers challenge end + flattening), then drain
+        # venue events, with heartbeats retrying exits, until every account is flat
         with eng.lock:
             eng.advance_to(max(self.last_ts, eng.end_ts))
-            guard = 0
-            while self._heap and guard < 1_000_000:
-                t, _p, _s, target, ev = heapq.heappop(self._heap)
-                target.handle(ev)
-                self.events += 1
-                guard += 1
-                if not self._heap:
-                    # let timers resolve any remaining timeouts, then drain again
-                    hb = max(t, eng.now) + eng.cfg.exchange.order_ack_timeout_ms
-                    eng.handle(TimerEvent(ts=hb, name="heartbeat"))
+            deadline = eng.now + self.drain_ms
+            hb_ms = eng.cfg.exchange.order_ack_timeout_ms
+            while True:
+                if self._heap:
+                    _t, _p, _s, target, ev = heapq.heappop(self._heap)
+                    target.handle(ev)
+                    self.events += 1
+                    continue
+                if eng.now >= deadline:
+                    if eng.flatten_pending():
+                        eng.flatten_incomplete()
+                    break
+                # let timers resolve timeouts and retry exits, then drain again
+                eng.handle(TimerEvent(ts=eng.now + hb_ms, name="heartbeat"))
+                if not self._heap and not eng.execution.open_orders() and not eng.flatten_pending():
+                    break
             return eng.finalize()
 
 

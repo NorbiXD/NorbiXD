@@ -28,6 +28,8 @@ IntentReason = Literal[
     "circuit_breaker",
     "kill_switch",
     "stale_exit",
+    "desync_exit",
+    "runtime_error",
 ]
 
 SYSTEM_REASONS = frozenset(
@@ -41,6 +43,8 @@ SYSTEM_REASONS = frozenset(
         "challenge_end",
         "circuit_breaker",
         "kill_switch",
+        "desync_exit",
+        "runtime_error",
     }
 )
 
