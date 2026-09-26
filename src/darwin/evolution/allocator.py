@@ -37,6 +37,14 @@ class AllocationCandidate:
     net_return: float
     bar_returns: np.ndarray
     regime_labels: tuple[str, ...]  # regime label per bar return (same length)
+    #: own-window absolute fitness; ``adjusted_fitness`` is relative to the cohort on the same
+    #: bars. Capital requires both: beating a losing crowd is not an edge.
+    absolute_fitness: float | None = None
+
+    @property
+    def has_edge(self) -> bool:
+        absolute = self.adjusted_fitness if self.absolute_fitness is None else self.absolute_fitness
+        return self.adjusted_fitness > 0 and absolute > 0
 
 
 class Allocator(Protocol):
@@ -99,7 +107,7 @@ class EqualWeightAllocator:
         self, cands: list[AllocationCandidate], regime: str, rng: np.random.Generator
     ) -> dict[str, float]:
         cfg = self.cfg
-        ok = [c for c in cands if c.eligible and c.status is AgentStatus.ALIVE and c.adjusted_fitness > 0]
+        ok = [c for c in cands if c.eligible and c.status is AgentStatus.ALIVE and c.has_edge]
         ok.sort(key=lambda c: -c.adjusted_fitness)
         explore = _explore(cands, {}, cfg)
         budget = 1 - cfg.cash_buffer - sum(explore.values())
@@ -120,7 +128,7 @@ class FitnessWeightedAllocator:
         ok = [
             c
             for c in cands
-            if c.eligible and c.status is AgentStatus.ALIVE and c.adjusted_fitness > 0 and c.ruin_prob <= 0.5
+            if c.eligible and c.status is AgentStatus.ALIVE and c.has_edge and c.ruin_prob <= 0.5
         ]
         explore = _explore(cands, {}, cfg)
         budget = 1 - cfg.cash_buffer - sum(explore.values())

@@ -25,7 +25,7 @@ from darwin.core.types import OrderStatus, OrderType, Side, TimeInForce, Urgency
 from darwin.execution.orders import ExecutionGateway, ManagedOrder, OrderRequest
 from darwin.market.state import MarketState
 from darwin.portfolio.ledger import Ledger, RoundTrip
-from darwin.risk.governor import RiskDecision, VenueHealth
+from darwin.risk.governor import Reservations, RiskDecision, VenueHealth
 
 log = logging.getLogger(__name__)
 
@@ -52,6 +52,7 @@ class ExecutionEngine:
         passive_ttl_ms: int = 30_000,
         max_queries: int = 3,
         on_fill: FillCallback | None = None,
+        run_tag: str = "",
     ) -> None:
         self.ledger = ledger
         self.market = market
@@ -62,10 +63,11 @@ class ExecutionEngine:
         self.passive_ttl_ms = passive_ttl_ms
         self.max_queries = max_queries
         self.on_fill_cb = on_fill
+        self.run_tag = run_tag
         self.orders: dict[str, ManagedOrder] = {}
         self._open_by_key: dict[tuple[str, str, str], set[str]] = {}
         self._open_ids: set[str] = set()
-        self._seen_exec: set[str] = set()
+        self._seen_exec: dict[str, None] = {}  # insertion-ordered: pruning keeps the newest
         self._seq = 0
         self.orphans: list[OrphanFill] = []
         self.duplicate_fills = 0
@@ -82,6 +84,20 @@ class ExecutionEngine:
     def open_orders(self) -> list[ManagedOrder]:
         return [self.orders[i] for i in sorted(self._open_ids)]
 
+    def reservations(self, account: str) -> Reservations:
+        """Exposure committed by all open risk-increasing orders in ``account`` (all agents)."""
+        qty: dict[str, float] = {}
+        new_pos: set[tuple[str, str]] = set()
+        acct = self.ledger.accounts.get(account)
+        for cid in self._open_ids:
+            o = self.orders[cid]
+            if o.account != account or not o.risk_increasing:
+                continue
+            qty[o.symbol] = qty.get(o.symbol, 0.0) + o.remaining
+            if acct is not None and acct.agent_qty(o.agent_id, o.symbol) == 0:
+                new_pos.add((o.agent_id, o.symbol))
+        return Reservations(qty_by_symbol=qty, new_positions=len(new_pos))
+
     def has_open(self, account: str, symbol: str) -> bool:
         return any(
             self.orders[i].account == account and self.orders[i].symbol == symbol for i in self._open_ids
@@ -91,8 +107,9 @@ class ExecutionEngine:
     def _next_id(self, account: str, agent_id: str) -> str:
         self._seq += 1
         prefix = "S" if account.startswith("shadow:") else "C"
-        # e.g. C-A0042-000123 ; deterministic and <= 36 chars
-        return f"{prefix}-{agent_id[-8:]}-{self._seq:07d}"
+        # e.g. C3f9a1-A0042-0000123: deterministic per run, unique across runs (exchange
+        # orderLinkIds must never collide with a previous run's), <= 36 chars
+        return f"{prefix}{self.run_tag}-{agent_id[-8:]}-{self._seq:07d}"
 
     def submit(self, decision: RiskDecision, intent: TradeIntent, now: int) -> ManagedOrder | None:
         if not decision.approved or decision.order_qty == 0:
@@ -102,7 +119,7 @@ class ExecutionEngine:
         st = self.market[decision.symbol]
         side = Side.BUY if decision.order_qty > 0 else Side.SELL
         qty = abs(decision.order_qty)
-        ref = decision.ref_price or st.ref_price() or 0.0
+        ref = decision.ref_price or st.ref_price(now) or 0.0
         order_type = OrderType.LIMIT
         if intent.urgency is Urgency.PASSIVE and decision.risk_increasing:
             price = st.book.best_bid() if side is Side.BUY else st.book.best_ask()
@@ -145,6 +162,7 @@ class ExecutionEngine:
             stop_loss_pct=intent.stop_loss_pct,
             take_profit_pct=intent.take_profit_pct,
             max_hold_ms=intent.max_hold_ms,
+            risk_increasing=decision.risk_increasing,
             created_ts=now,
             last_update_ts=now,
         )
@@ -208,7 +226,7 @@ class ExecutionEngine:
         if ev.exec_id in self._seen_exec:
             self.duplicate_fills += 1
             return None, []
-        self._seen_exec.add(ev.exec_id)
+        self._seen_exec[ev.exec_id] = None
         mo = self.orders.get(ev.client_order_id)
         if mo is None:
             return None, self._orphan_fill(ev)
@@ -290,6 +308,23 @@ class ExecutionEngine:
         for mo in self.open_orders():
             venue = self.account_venue(mo.account)
             gw = self.gateways[venue]
+            if mo.status.terminal and mo.awaiting_fills > 0:
+                # the venue says it executed more than we have fills for: ask for the executions
+                if now - mo.last_update_ts >= self.ack_timeout_ms:
+                    if mo.queries >= self.max_queries:
+                        # give up waiting; trust fills and let position reconciliation arbitrate
+                        mo.reported_cum_qty = mo.filled_qty
+                        h = self.health[venue]
+                        h.reconcile_ok = False
+                        h.reconcile_detail = (
+                            f"{mo.account}:{mo.symbol} missing fills for {mo.client_order_id}"
+                        )
+                        self._maybe_close(mo)
+                        continue
+                    mo.queries += 1
+                    mo.last_update_ts = now
+                    gw.query_order(mo.account, mo.client_order_id, mo.symbol, now)
+                continue
             if mo.status is OrderStatus.UNKNOWN:
                 # keep asking, at a slower cadence, until the venue gives a definitive answer
                 if now - mo.last_update_ts >= 10 * self.ack_timeout_ms:
@@ -315,6 +350,16 @@ class ExecutionEngine:
             ):
                 mo.last_update_ts = now
                 gw.cancel(mo.account, mo.client_order_id, mo.symbol, now)
+
+    def prune(self, now: int, keep_ms: int = 3_600_000) -> int:
+        """Forget resolved orders older than ``keep_ms`` and bound the exec-id memory."""
+        stale = [c for c, o in self.orders.items() if not o.open and now - o.last_update_ts > keep_ms]
+        for c in stale:
+            del self.orders[c]
+        if len(self._seen_exec) > 200_000:
+            # exec ids of long-resolved orders can no longer arrive; keep the most recent half
+            self._seen_exec = dict.fromkeys(list(self._seen_exec)[-100_000:])
+        return len(stale)
 
     def drop_account(self, account: str) -> None:
         """Forget closed orders of a retired shadow account (memory hygiene)."""

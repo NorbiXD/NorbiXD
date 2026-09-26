@@ -40,12 +40,27 @@ def find_intent(
     return rows[0]["intent_id"] if rows else None
 
 
-def explain(store: AuditStore, intent_id: str) -> dict[str, Any] | None:
-    intent = store.one("intents", intent_id=intent_id)
-    if intent is None:
+class AmbiguousIntent(ValueError):
+    pass
+
+
+def explain(store: AuditStore, intent_id: str, run_id: str | None = None) -> dict[str, Any] | None:
+    """Reconstruct one decision. Ids repeat across runs, so everything is scoped to ``run_id``
+    (inferred when the id is unique in the database, otherwise required)."""
+    matches = store.query("intents", intent_id=intent_id, **({"run_id": run_id} if run_id else {}))
+    if not matches:
         return None
-    run_id = intent["run_id"]
-    snapshot = store.one("snapshots", snapshot_id=intent["snapshot_ref"]) if intent["snapshot_ref"] else None
+    if len(matches) > 1:
+        raise AmbiguousIntent(
+            f"{intent_id} exists in runs {sorted(m['run_id'] for m in matches)}; pass run_id"
+        )
+    intent = matches[0]
+    run_id = str(intent["run_id"])
+    snapshot = (
+        store.one("snapshots", run_id=run_id, snapshot_id=intent["snapshot_ref"])
+        if intent["snapshot_ref"]
+        else None
+    )
     genome = store.one("genomes", genome_id=intent["genome_id"])
     agent = store.one("agents", run_id=run_id, agent_id=intent["agent_id"])
     lineage = _rows(
@@ -55,13 +70,15 @@ def explain(store: AuditStore, intent_id: str) -> dict[str, Any] | None:
         .order_by(schema.lineage.c.ts),
     )
     signals_detail = [
-        row for sid in (intent["signals"] or []) if (row := store.one("signals", signal_id=sid)) is not None
+        row
+        for sid in (intent["signals"] or [])
+        if (row := store.one("signals", run_id=run_id, signal_id=sid)) is not None
     ]
-    decisions = store.query("risk_decisions", intent_id=intent_id)
-    orders = store.query("orders", intent_id=intent_id)
+    decisions = store.query("risk_decisions", run_id=run_id, intent_id=intent_id)
+    orders = store.query("orders", run_id=run_id, intent_id=intent_id)
     fills: list[dict[str, Any]] = []
     for o in orders:
-        fills += store.query("fills", client_order_id=o["client_order_id"])
+        fills += store.query("fills", run_id=run_id, client_order_id=o["client_order_id"])
     t = schema.trades
     trades = _rows(
         store,

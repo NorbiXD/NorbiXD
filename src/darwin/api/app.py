@@ -160,7 +160,7 @@ def create_app(engine: DarwinEngine, webhooks: dict[str, WebhookSignalFeed] | No
         if store is None:
             raise HTTPException(503, "no audit store configured")
         store.flush()
-        ex = explain(store, intent_id)
+        ex = explain(store, intent_id, run_id=engine.run_id)
         if ex is None:
             raise HTTPException(404, "unknown intent")
         return _jsonable(ex)
@@ -174,7 +174,7 @@ def create_app(engine: DarwinEngine, webhooks: dict[str, WebhookSignalFeed] | No
         iid = find_intent(store, agent, symbol, at, run_id=engine.run_id)
         if iid is None:
             raise HTTPException(404, "no decision found")
-        return _jsonable(explain(store, iid))
+        return _jsonable(explain(store, iid, run_id=engine.run_id))
 
     @app.get("/api/signals/recent")
     def signals_recent(limit: int = Query(50, le=200)) -> Any:

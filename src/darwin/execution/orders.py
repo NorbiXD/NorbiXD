@@ -64,6 +64,7 @@ class ManagedOrder:
     stop_loss_pct: float | None
     take_profit_pct: float | None
     max_hold_ms: int | None
+    risk_increasing: bool = True
     status: OrderStatus = OrderStatus.PENDING_NEW
     exchange_order_id: str | None = None
     filled_qty: float = 0.0  # from fills (authoritative for positions)
@@ -90,8 +91,24 @@ class ManagedOrder:
         return self.request.symbol
 
     @property
-    def remaining(self) -> float:
+    def unfilled(self) -> float:
         return max(self.request.qty - self.filled_qty, 0.0)
+
+    @property
+    def awaiting_fills(self) -> float:
+        """Quantity the venue reports executed but whose executions have not reached us yet.
+
+        Bybit's ``order`` and ``execution`` streams are not ordered relative to each other: a
+        ``Filled`` update can arrive before the fills. Until they do, the order still carries
+        exposure the ledger cannot see.
+        """
+        gap = self.reported_cum_qty - self.filled_qty
+        return gap if gap > 1e-12 else 0.0
+
+    @property
+    def remaining(self) -> float:
+        """Exposure still in flight: unfilled qty while working, missing fills once terminal."""
+        return self.awaiting_fills if self.status.terminal else self.unfilled
 
     @property
     def signed_remaining(self) -> float:
@@ -99,7 +116,7 @@ class ManagedOrder:
 
     @property
     def open(self) -> bool:
-        return not self.status.terminal
+        return not self.status.terminal or self.awaiting_fills > 0
 
     def apply_status(self, status: OrderStatus, ts: int) -> bool:
         """Advance the state machine. Returns False if the update was stale/illegal."""
@@ -122,7 +139,7 @@ class ManagedOrder:
         self.last_update_ts = ts
         if self.acked_ts is None:
             self.acked_ts = ts  # a fill implies acceptance even if the ACK is late/lost
-        if self.remaining <= 1e-12:
+        if self.unfilled <= 1e-12:
             self.status = OrderStatus.FILLED
         elif not self.status.terminal:
             self.status = OrderStatus.PARTIALLY_FILLED

@@ -29,6 +29,7 @@ from typing import Any
 import numpy as np
 
 from darwin.agents.agent import Agent
+from darwin.agents.genome import Genome
 from darwin.config.challenge import ChallengeConfig
 from darwin.core.events import (
     BookDelta,
@@ -47,7 +48,7 @@ from darwin.core.events import (
     TradeEvent,
     WalletSnapshot,
 )
-from darwin.core.ids import Sequence
+from darwin.core.ids import Sequence, content_hash
 from darwin.core.intent import IntentReason, TradeIntent
 from darwin.core.types import AgentStatus, LineageEventKind
 from darwin.evolution.allocator import AllocationCandidate, make_allocator
@@ -103,7 +104,7 @@ class DarwinEngine:
         self.finalized = False
         self.final_equity: float | None = None
 
-        self.market = MarketState(self.symbols)
+        self.market = MarketState(self.symbols, max_price_age_ms=cfg.risk.max_data_staleness_ms)
         self.builders = {s: BarBuilder(s) for s in self.symbols}
         max_lb = 800
         self.features = FeatureEngine(self.symbols, max_bars=max_lb)
@@ -120,6 +121,7 @@ class DarwinEngine:
             account_venue=account_venue,
             health=self.health,
             ack_timeout_ms=cfg.exchange.order_ack_timeout_ms,
+            run_tag=content_hash(run_id, length=5),
         )
         self.execution.set_tick_sizes({s: spec.tick_size for s, spec in self.instruments.items()})
         horizon_days = cfg.challenge.duration_hours / 24
@@ -135,8 +137,12 @@ class DarwinEngine:
         self.marks: dict[str, float] = {}
         self.kill_flattened = False
         self.last_reconcile_ts = start_ts
+        self._last_prune = start_ts
         self.observers: list[BarObserver] = []
         self.on_resync_needed: Callable[[str], None] | None = None
+        self._resync_requested: dict[str, int] = {}
+        self.venue_equity_base: float | None = None
+        self.ledger_equity_base: float | None = None
         # observability
         self.stats: Counter[str] = Counter()
         self.reject_reasons: Counter[str] = Counter()
@@ -153,7 +159,7 @@ class DarwinEngine:
     def attach_gateway(self, venue: str, gateway: ExecutionGateway) -> None:
         self.gateways[venue] = gateway
 
-    def start(self) -> None:
+    def start(self, seed_genomes: list[tuple[Genome, str]] | None = None, fill: bool = True) -> None:
         """Seed the population and open accounts. Call once, after gateways are attached."""
         if SHADOW_VENUE not in self.gateways or CHALLENGE_VENUE not in self.gateways:
             raise RuntimeError("attach shadow and challenge gateways before start()")
@@ -178,7 +184,7 @@ class DarwinEngine:
                     "status": "running",
                 },
             )
-        for agent in self.population.seed(self.start_ts):
+        for agent in self.population.seed(self.start_ts, seed_genomes, fill):
             self._on_birth(agent)
         self._persist_lineage(self.population.drain_lineage())
 
@@ -220,19 +226,43 @@ class DarwinEngine:
             if mo is not None:
                 self._persist_order(mo)
         elif isinstance(ev, FundingPayment):
-            self.ledger.on_funding(ev.account, ev.symbol, ev.rate, ev.mark_price)
+            residual = self.ledger.on_funding(ev.account, ev.symbol, ev.rate, ev.mark_price, amount=ev.amount)
             self.stats["funding_payments"] += 1
+            if abs(residual) > 1e-6:
+                self._system_event(
+                    "funding_unattributed",
+                    {
+                        "account": ev.account,
+                        "symbol": ev.symbol,
+                        "venue_amount": ev.amount,
+                        "residual": residual,
+                    },
+                )
         elif isinstance(ev, PositionSnapshot):
             self._reconcile_position(ev)
         elif isinstance(ev, WalletSnapshot):
             if ev.account == CHALLENGE:
-                self.venue_equity = ev.equity
+                self._reconcile_wallet(ev)
         elif isinstance(ev, IntelligenceSignal):
             self._on_signal(ev)
         elif isinstance(ev, TimerEvent):
             self._on_timer(ev)
         elif isinstance(ev, FeedStatus):
             self._on_feed_status(ev)
+
+    def audit_flush_failed(self, error: str) -> None:
+        """The audit trail is a hard requirement: without it, no new real-money risk."""
+        h = self.health[CHALLENGE_VENUE]
+        if not h.halted:
+            h.halted = "audit_store_unavailable"
+            self.stats["audit_flush_failures"] += 1
+            log.error("audit store flush failed: %s -> new challenge risk halted", error)
+
+    def audit_flush_ok(self) -> None:
+        h = self.health[CHALLENGE_VENUE]
+        if h.halted == "audit_store_unavailable":
+            h.halted = ""
+            log.warning("audit store recovered -> risk halt lifted")
 
     def _on_signal(self, ev: IntelligenceSignal) -> None:
         self.signals.add(ev)
@@ -313,8 +343,13 @@ class DarwinEngine:
             self._system_event(
                 "book_invalid", {"symbol": ev.symbol, "reason": self.market[ev.symbol].book.invalid_reason}
             )
-            if self.on_resync_needed is not None:
+            last = self._resync_requested.get(ev.symbol)
+            if self.on_resync_needed is not None and (last is None or ev.ts - last >= 5_000):
+                self._resync_requested[ev.symbol] = ev.ts  # one request per gap, re-armed after 5s
+                self.stats["resync_requests"] += 1
                 self.on_resync_needed(ev.symbol)
+        elif isinstance(ev, BookSnapshot) and ok:
+            self._resync_requested.pop(ev.symbol, None)
         elif isinstance(ev, TickerEvent) and ev.mark_price is not None:
             self._check_guards(ev.symbol, ev.mark_price)
 
@@ -378,19 +413,8 @@ class DarwinEngine:
             self._end_challenge(end_ts)
             return
 
-        # safety systems
-        trip = self.governor.check_breakers(chal, chal.last_equity)
-        if trip:
-            self._system_event("circuit_breaker", {"reason": trip, "equity": chal.last_equity})
-            if lim.flatten_on_breaker:
-                self._flatten_account(CHALLENGE, "circuit_breaker")
-        if self.governor.kill_switch_active():
-            if not self.kill_flattened:
-                self._system_event("kill_switch", {"equity": chal.last_equity})
-                self._flatten_account(CHALLENGE, "kill_switch")
-                self.kill_flattened = True
-        else:
-            self.kill_flattened = False
+        self._safety_check(chal.last_equity)
+        self.ledger.closed_trades.clear()  # consumed via on_fill's return value
 
         evolved = False
         if self.bar_index % self.cfg.evolution.generation_bars == 0:
@@ -434,7 +458,15 @@ class DarwinEngine:
             marks = self._marks()
             pending = self.execution.pending_qty(acct_id, aid, intent.symbol)
             decision = self.governor.evaluate(
-                intent, acct, capital, st, marks, pending, self.now, self.health[account_venue(acct_id)]
+                intent,
+                acct,
+                capital,
+                st,
+                marks,
+                pending,
+                self.now,
+                self.health[account_venue(acct_id)],
+                self.execution.reservations(acct_id),
             )
             self._persist_decision(decision)
             mo = self.execution.submit(decision, intent, self.now) if decision.approved else None
@@ -473,7 +505,7 @@ class DarwinEngine:
     def _marks(self) -> dict[str, float]:
         out = dict(self.marks)
         for s in self.symbols:
-            p = self.market[s].ref_price()
+            p = self.market[s].ref_price(self.now)
             if p:
                 out[s] = p
         return out
@@ -578,6 +610,7 @@ class DarwinEngine:
                     net_return=e.report.net_return,
                     bar_returns=r,
                     regime_labels=labels,
+                    absolute_fitness=e.report.fitness,
                 )
             )
         new = self.allocator.allocate(cands, regime, self.alloc_rng)
@@ -621,7 +654,7 @@ class DarwinEngine:
             return
         for sym in agent.genome.symbols:
             qty = sacct.agent_qty(agent.agent_id, sym)
-            price = self.market[sym].ref_price()
+            price = self.market[sym].ref_price(self.now)
             if not price or qty == 0:
                 continue
             exposure = qty * price / eq
@@ -753,8 +786,58 @@ class DarwinEngine:
             h.reconcile_detail = ""
             self._system_event("reconcile_recovered", {"account": ev.account, "symbol": ev.symbol})
 
+    def _safety_check(self, equity: float) -> None:
+        """Breakers and kill switch. Runs at every bar close *and* every heartbeat, so a trip
+        or a touched KILL file acts within a heartbeat, not a bar."""
+        if self.ended:
+            return
+        chal = self.ledger[CHALLENGE]
+        trip = self.governor.check_breakers(chal, equity)
+        if trip:
+            self._system_event("circuit_breaker", {"reason": trip, "equity": equity})
+            if self.cfg.risk.flatten_on_breaker:
+                self._flatten_account(CHALLENGE, "circuit_breaker")
+        if self.governor.kill_switch_active():
+            if not self.kill_flattened:
+                self._system_event("kill_switch", {"equity": equity})
+                self._flatten_account(CHALLENGE, "kill_switch")
+                self.kill_flattened = True
+        else:
+            self.kill_flattened = False
+
+    def _reconcile_wallet(self, ev: WalletSnapshot) -> None:
+        """Compare venue PnL with ledger PnL since the first snapshot (the venue wallet may hold
+        more than the challenge capital, so levels are not comparable; changes are)."""
+        self.venue_equity = ev.equity
+        ledger_eq = self.ledger[CHALLENGE].equity(self._marks())
+        if self.venue_equity_base is None:
+            self.venue_equity_base, self.ledger_equity_base = ev.equity, ledger_eq
+            return
+        if self.execution.open_orders():
+            return  # fills in flight make a transient difference legitimate
+        assert self.ledger_equity_base is not None
+        drift = (ev.equity - self.venue_equity_base) - (ledger_eq - self.ledger_equity_base)
+        tol = max(1.0, 0.02 * self.cfg.challenge.starting_capital)
+        h = self.health[CHALLENGE_VENUE]
+        if abs(drift) > tol:
+            if h.reconcile_ok:
+                self._system_event(
+                    "wallet_drift", {"drift": drift, "venue_equity": ev.equity, "ledger": ledger_eq}
+                )
+            h.reconcile_ok = False
+            h.reconcile_detail = f"wallet pnl drift {drift:+.2f}"
+        elif not h.reconcile_ok and h.reconcile_detail.startswith("wallet pnl drift"):
+            h.reconcile_ok = True
+            h.reconcile_detail = ""
+            self._system_event("wallet_reconciled", {"drift": drift})
+
     def _on_timer(self, ev: TimerEvent) -> None:
         self.execution.check_timeouts(self.now)
+        if self.marks:
+            self._safety_check(self.ledger[CHALLENGE].equity(self._marks()))
+        if self.now - self._last_prune >= 600_000:
+            self._last_prune = self.now
+            self.execution.prune(self.now)
         if self.now - self.last_reconcile_ts >= self.cfg.exchange.reconcile_interval_ms:
             self.last_reconcile_ts = self.now
             gw = self.gateways.get(CHALLENGE_VENUE)
@@ -1022,9 +1105,13 @@ class DarwinEngine:
                 }
             )
 
-        def sort_key(r: dict[str, Any]) -> tuple[bool, float]:
+        def sort_key(r: dict[str, Any]) -> tuple[bool, bool, float]:
             f = r["fitness"]
-            return (r["status"] == AgentStatus.DEAD.value, -(float(f) if f is not None else -math.inf))
+            return (
+                r["status"] == AgentStatus.DEAD.value,
+                not r["eligible"],  # proven agents rank above zero-evidence ones
+                -(float(f) if f is not None else -math.inf),
+            )
 
         rows.sort(key=sort_key)
         return rows

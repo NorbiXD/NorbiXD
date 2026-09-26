@@ -19,11 +19,13 @@ from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
+from darwin.agents.genome import Genome
 from darwin.config.challenge import ChallengeConfig
 from darwin.core.events import Event
 from darwin.core.types import Mode
 from darwin.exchange.bybit.feeds import BybitMarketFeed, BybitPrivateFeed
 from darwin.exchange.bybit.gateway import BybitExecutionGateway
+from darwin.exchange.bybit.preflight import PreflightReport, account_preflight
 from darwin.exchange.bybit.rest import BybitRest
 from darwin.exchange.bybit.signing import Credentials
 from darwin.exchange.bybit.ws import MAINNET, TESTNET
@@ -128,6 +130,7 @@ def build_runtime(
     run_id: str,
     events: Iterable[Event] | None = None,
     start_ts: int | None = None,
+    seed_genomes: list[tuple[Genome, str]] | None = None,
 ) -> Runtime:
     mode = cfg.challenge.mode
     assert_live_allowed(cfg, mode)
@@ -141,6 +144,7 @@ def build_runtime(
             store=store,
             run_id=run_id,
             intelligence=cfg.intelligence.mock.enabled,
+            seed_genomes=seed_genomes,
         )
 
         async def run_replay() -> float:
@@ -149,13 +153,18 @@ def build_runtime(
         return Runtime(engine=h.engine, run=run_replay, info={"mode": mode.value})
 
     if mode is Mode.SIM:
+        if cfg.sim.speed > 600:
+            log.warning(
+                "sim speed %.0fx: event re-stamping degrades simulated venue timing above ~600x",
+                cfg.sim.speed,
+            )
         t0 = start_ts if start_ts is not None else (int(time.time() * 1000) // 60_000) * 60_000
         engine = DarwinEngine(cfg, run_id=run_id, start_ts=t0, store=store)
         clock = Clock(speed=cfg.sim.speed, origin_ms=t0)
         driver = LiveDriver(engine, [], clock)
         driver.venues = _sim_venues(cfg, engine, driver, challenge_sim=True)
         _attach_intelligence(cfg, engine, driver)
-        engine.start()
+        engine.start(seed_genomes)
         feed = SyntheticFeed(driver, events if events is not None else synthetic_stream(cfg, t0))
 
         async def run_sim() -> float:
@@ -184,6 +193,7 @@ def build_runtime(
     engine.on_resync_needed = market_feed.resync
     cleanup: list[Callable[[], Awaitable[None]]] = []
     private_feed: BybitPrivateFeed | None = None
+    preflight: Callable[[], Awaitable[PreflightReport]] | None = None
     if mode is Mode.PAPER:
         driver.venues = _sim_venues(cfg, engine, driver, challenge_sim=True)
     else:
@@ -200,10 +210,21 @@ def build_runtime(
         driver.venues = _sim_venues(cfg, engine, driver, challenge_sim=False)
         engine.attach_gateway(CHALLENGE_VENUE, gateway)
         private_feed = BybitPrivateFeed(driver, gateway, endpoints.private_ws, creds, CHALLENGE)
+
+        async def preflight() -> PreflightReport:
+            return await account_preflight(rest, cfg, instruments, strict=mode is Mode.LIVE)
+
     _attach_intelligence(cfg, engine, driver)
-    engine.start()
+    engine.start(seed_genomes)
 
     async def run_streams() -> float:
+        if preflight is not None:
+            rep = await preflight()
+            for w in rep.warnings:
+                log.warning("preflight: %s", w)
+            log.info(
+                "preflight ok: equity=%.2f margin=%s leverage=%s", rep.equity, rep.margin_mode, rep.leverage
+            )
         tasks = [asyncio.create_task(market_feed.run())]
         if private_feed is not None:
             tasks.append(asyncio.create_task(private_feed.run()))
@@ -222,6 +243,21 @@ def build_runtime(
         info={"mode": mode.value, "endpoints": endpoints},
         webhooks=_webhooks(cfg, driver),
     )
+
+
+async def prepare_config(cfg: ChallengeConfig) -> ChallengeConfig:
+    """Before the engine exists (instrument specs are frozen into the governor), pull the real
+    lot/tick/leverage filters from Bybit. Best effort for paper; mandatory for testnet/live."""
+    mode = cfg.challenge.mode
+    if mode not in (Mode.PAPER, Mode.TESTNET, Mode.LIVE):
+        return cfg
+    try:
+        return await refresh_instruments(cfg, testnet=mode is Mode.TESTNET)
+    except Exception as e:
+        if mode is Mode.PAPER:
+            log.warning("instrument refresh failed (%s); using fallback specs for paper trading", e)
+            return cfg
+        raise
 
 
 async def refresh_instruments(cfg: ChallengeConfig, testnet: bool = False) -> ChallengeConfig:

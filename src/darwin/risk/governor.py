@@ -35,8 +35,11 @@ class VenueHealth:
     reconcile_ok: bool = True
     reconcile_detail: str = ""
     connected: bool = True
+    halted: str = ""  # e.g. "audit_store_unavailable": no new risk without an audit trail
 
     def healthy(self, max_errors: int) -> tuple[bool, str]:
+        if self.halted:
+            return False, self.halted
         if not self.connected:
             return False, "venue_disconnected"
         if self.consecutive_errors >= max_errors:
@@ -92,6 +95,19 @@ class RiskDecision:
         }
 
 
+@dataclass(frozen=True)
+class Reservations:
+    """Exposure already committed by in-flight orders of *all* agents in an account.
+
+    All agents decide on the same bar close and orders take tens of milliseconds to fill, so
+    limits computed from filled positions alone would let N agents each consume the full
+    headroom. Risk-increasing open orders therefore reserve exposure until they resolve.
+    """
+
+    qty_by_symbol: dict[str, float] = field(default_factory=dict)  # gross |qty| still to fill
+    new_positions: int = 0  # (agent, symbol) pairs flat now but with an increasing order in flight
+
+
 @dataclass
 class _AccountGuard:
     orders_ts: deque[int] = field(default_factory=lambda: deque(maxlen=10_000))
@@ -123,6 +139,8 @@ class RiskGovernor:
         self._guards: dict[str, _AccountGuard] = {}
         self._ids = Sequence("RD", width=8)
         self._manual_kill = False
+        # resolved once so a later chdir cannot silently move the kill switch
+        self._kill_file = os.path.abspath(limits.kill_switch_file) if limits.kill_switch_file else None
 
     # read-only views -------------------------------------------------------------
     @property
@@ -146,8 +164,11 @@ class RiskGovernor:
     def kill_switch_active(self) -> bool:
         if self._manual_kill:
             return True
-        f = self._limits.kill_switch_file
-        return bool(f) and os.path.exists(f)  # type: ignore[arg-type]
+        return self._kill_file is not None and os.path.exists(self._kill_file)
+
+    @property
+    def kill_switch_path(self) -> str | None:
+        return self._kill_file
 
     def breaker(self, account_id: str) -> str | None:
         g = self._guards.get(account_id)
@@ -196,14 +217,18 @@ class RiskGovernor:
         pending_qty: float,
         now: int,
         health: VenueHealth,
+        reservations: Reservations | None = None,
     ) -> RiskDecision:
         lim = self._limits
+        res = reservations or Reservations()
         reasons: list[str] = []
         clipped = False
         sym = intent.symbol
         current = acct.agent_qty(intent.agent_id, sym)
         equity = acct.equity(marks)
-        ref = market.ref_price()
+        # fresh price for anything that adds risk; any last-known price is acceptable to get flat
+        ref_fresh = market.ref_price(now)
+        ref = ref_fresh or market.ref_price()
 
         def decide(
             approved: bool, target: float = 0.0, order: float = 0.0, requested: float = 0.0, inc: bool = False
@@ -293,7 +318,7 @@ class RiskGovernor:
         if not ok:
             reasons.append(why)
             return reject_inc()
-        if market.is_stale(now, lim.max_data_staleness_ms):
+        if ref_fresh is None or market.is_stale(now, lim.max_data_staleness_ms):
             reasons.append(f"stale_data({market.staleness_ms(now)}ms,{market.book.invalid_reason or 'age'})")
             return reject_inc()
         if equity <= 0:
@@ -325,8 +350,8 @@ class RiskGovernor:
                 reasons.append("duplicate_intent")
                 return reject_inc()
 
-        # concurrent positions (count agent/symbol sub-positions in this account)
-        if current == 0 and len(acct.open_positions()) >= lim.max_concurrent_positions:
+        # concurrent positions: filled sub-positions + new ones already in flight
+        if current == 0 and len(acct.open_positions()) + res.new_positions >= lim.max_concurrent_positions:
             reasons.append("max_concurrent_positions")
             return reject_inc()
 
@@ -337,9 +362,13 @@ class RiskGovernor:
             clipped = True
             reasons.append("clip:agent_leverage")
 
-        # exposure after the change: per symbol and gross (gross of agent sub-positions)
-        gross_now = acct.gross_notional(marks)
-        sym_now = acct.symbol_gross_notional(sym, ref)
+        # exposure after the change: per symbol and gross (gross of agent sub-positions), counting
+        # exposure reserved by every agent's in-flight risk-increasing orders
+        reserved_gross = sum(
+            q * (ref if s == sym else marks.get(s, 0.0)) for s, q in res.qty_by_symbol.items()
+        )
+        gross_now = acct.gross_notional(marks) + reserved_gross
+        sym_now = acct.symbol_gross_notional(sym, ref) + res.qty_by_symbol.get(sym, 0.0) * ref
         cur_notional = abs(current) * ref
 
         def headroom(limit_notional: float, used: float) -> float:

@@ -20,7 +20,9 @@ from tests.conftest import T0, make_config
 
 
 def test_parquet_round_trip_preserves_events_and_order(tmp_path: Path) -> None:
-    m = SyntheticMarket(symbols=("BTCUSDT", "ETHUSDT"), start_ts=T0, duration_ms=3_600_000, step_ms=5_000, seed=1)
+    m = SyntheticMarket(
+        symbols=("BTCUSDT", "ETHUSDT"), start_ts=T0, duration_ms=3_600_000, step_ms=5_000, seed=1
+    )
     events: list[Event] = list(m.events())
     events.append(IntelligenceSignal(ts=T0 + 1_000, signal_id="s", source="t", value=0.3, confidence=0.5))
     events.sort(key=lambda e: e.ts)
@@ -30,15 +32,24 @@ def test_parquet_round_trip_preserves_events_and_order(tmp_path: Path) -> None:
     loaded = list(load_events(tmp_path / "run1"))
     assert loaded == events
     only_btc_trades = list(load_events(tmp_path / "run1", kinds=("trade",), symbols=("BTCUSDT",)))
-    assert only_btc_trades and all(isinstance(e, TradeEvent) and e.symbol == "BTCUSDT" for e in only_btc_trades)
+    assert only_btc_trades and all(
+        isinstance(e, TradeEvent) and e.symbol == "BTCUSDT" for e in only_btc_trades
+    )
     window = list(load_events(tmp_path / "run1", start_ts=T0 + 600_000, end_ts=T0 + 1_200_000))
     assert all(T0 + 600_000 <= e.ts < T0 + 1_200_000 for e in window)
 
 
 def test_replay_from_recording_is_identical_to_direct(tmp_path: Path) -> None:
-    cfg = make_config(challenge={"duration_hours": 3}, evolution={"population_size": 8, "generation_bars": 40})
-    m = SyntheticMarket(symbols=cfg.challenge.symbols, start_ts=T0, duration_ms=cfg.duration_ms + 60_000,
-                        step_ms=5_000, seed=6)
+    cfg = make_config(
+        challenge={"duration_hours": 3}, evolution={"population_size": 8, "generation_bars": 40}
+    )
+    m = SyntheticMarket(
+        symbols=cfg.challenge.symbols,
+        start_ts=T0,
+        duration_ms=cfg.duration_ms + 60_000,
+        step_ms=5_000,
+        seed=6,
+    )
     events = list(m.events())
     ParquetRecorder(tmp_path, "rec").record_all(events)
     a = build_replay(cfg, iter(events), T0)
@@ -67,7 +78,9 @@ def test_bybit_trade_dump_loader(tmp_path: Path) -> None:
 
 
 def _feed(out: list[IntelligenceSignal]) -> WebhookSignalFeed:
-    return WebhookSignalFeed("alpha", "s3cret-s3cret-s3cret", out.append, lambda: T0, ("BTCUSDT",), max_per_minute=3)
+    return WebhookSignalFeed(
+        "alpha", "s3cret-s3cret-s3cret", out.append, lambda: T0, ("BTCUSDT",), max_per_minute=3
+    )
 
 
 def test_webhook_requires_valid_signature_and_schema() -> None:
@@ -113,11 +126,18 @@ def test_webhook_rate_limit_and_disabled_feed() -> None:
 @pytest.fixture(scope="module")
 def api(tmp_path_factory: pytest.TempPathFactory) -> tuple[TestClient, list[IntelligenceSignal]]:
     tmp = tmp_path_factory.mktemp("api")
-    cfg = make_config(challenge={"duration_hours": 6},
-                      evolution={"population_size": 10, "generation_bars": 60, "min_trades": 2})
+    cfg = make_config(
+        challenge={"duration_hours": 6},
+        evolution={"population_size": 10, "generation_bars": 60, "min_trades": 2},
+    )
     store = AuditStore(f"sqlite:///{tmp / 'api.db'}", run_id="api")
-    m = SyntheticMarket(symbols=cfg.challenge.symbols, start_ts=T0, duration_ms=cfg.duration_ms + 60_000,
-                        step_ms=5_000, seed=3)
+    m = SyntheticMarket(
+        symbols=cfg.challenge.symbols,
+        start_ts=T0,
+        duration_ms=cfg.duration_ms + 60_000,
+        step_ms=5_000,
+        seed=3,
+    )
     h = build_replay(cfg, m.events(), T0, store=store, run_id="api", intelligence=True)
     h.driver.run()
     pushed: list[IntelligenceSignal] = []
@@ -144,7 +164,9 @@ def test_api_read_models(api) -> None:  # type: ignore[no-untyped-def]
 def test_api_explain_and_attribution(api) -> None:  # type: ignore[no-untyped-def]
     client, _ = api
     d = client.get("/api/decisions?limit=50").json()
-    iid = next(x["intent_id"] for x in d if x["reason"] in ("entry", "exit", "flip", "stop_loss", "take_profit"))
+    iid = next(
+        x["intent_id"] for x in d if x["reason"] in ("entry", "exit", "flip", "stop_loss", "take_profit")
+    )
     ex = client.get(f"/api/explain/{iid}").json()
     assert ex["intent"]["intent_id"] == iid and "risk_decisions" in ex
     why = client.get("/api/why", params={"agent": ex["intent"]["agent_id"], "at": ex["intent"]["ts"]}).json()
@@ -158,8 +180,11 @@ def test_api_explain_and_attribution(api) -> None:  # type: ignore[no-untyped-de
 def test_api_webhook_and_kill_switch(api, monkeypatch: pytest.MonkeyPatch) -> None:  # type: ignore[no-untyped-def]
     client, pushed = api
     body = json.dumps({"id": "w1", "value": -0.4, "confidence": 0.7}).encode()
-    r = client.post("/api/signals/alpha", content=body,
-                    headers={"X-Darwin-Signature": WebhookSignalFeed.sign("s3cret-s3cret-s3cret", body)})
+    r = client.post(
+        "/api/signals/alpha",
+        content=body,
+        headers={"X-Darwin-Signature": WebhookSignalFeed.sign("s3cret-s3cret-s3cret", body)},
+    )
     assert r.status_code == 202 and pushed
     assert client.post("/api/signals/alpha", content=body).status_code == 401
     assert client.post("/api/signals/unknown", content=body).status_code == 404

@@ -11,16 +11,21 @@ import socket
 import sys
 import time
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import uvicorn
 
 from darwin.api.app import create_app
-from darwin.attribution.explain import explain, find_intent
+from darwin.attribution.explain import AmbiguousIntent, explain, find_intent
 from darwin.config.challenge import ChallengeConfig, load_config
 from darwin.core.types import Mode
+from darwin.evolution.bench import run_bench
+from darwin.evolution.tournament import load_champions, run_tournament
+from darwin.market.synthetic import SyntheticMarket
 from darwin.persistence.store import AuditStore
-from darwin.runtime.app import build_runtime, synthetic_stream
+from darwin.replay.recorder import load_events
+from darwin.runtime.app import build_runtime, prepare_config, synthetic_stream
 from darwin.runtime.replay import build_replay
 
 
@@ -91,13 +96,16 @@ async def _serve_api(server: uvicorn.Server) -> None:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    cfg = _config(args)
+    cfg = asyncio.run(prepare_config(_config(args)))
     if not args.no_api and not _port_free(cfg.api.host, cfg.api.port):
         print(f"API port {cfg.api.host}:{cfg.api.port} is busy; free it or pass --no-api", file=sys.stderr)
         return 2
     run_id = args.run_id or f"{cfg.challenge.mode.value}-{int(time.time())}"
     store = AuditStore(cfg.persistence.database_url, run_id=run_id)
-    rt = build_runtime(cfg, store, run_id)
+    seeds = load_champions(args.seed_genomes, min_holdout_fitness=0.0) if args.seed_genomes else None
+    if seeds is not None:
+        print(f"seeding {len(seeds)} champion genomes from {args.seed_genomes}")
+    rt = build_runtime(cfg, store, run_id, seed_genomes=seeds)
     logging.getLogger(__name__).info(
         "run %s mode=%s db=%s", run_id, cfg.challenge.mode.value, cfg.persistence.database_url
     )
@@ -165,6 +173,73 @@ def cmd_replay(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_evolve(args: argparse.Namespace) -> int:
+    args.mode = Mode.REPLAY.value
+    cfg = _config(args)
+    t0 = 1_700_000_000_000
+    train_ms, hold_ms = int(args.train_hours * 3_600_000), int(args.holdout_hours * 3_600_000)
+    m = SyntheticMarket(
+        symbols=cfg.challenge.symbols,
+        start_ts=t0,
+        duration_ms=train_ms + hold_ms,
+        seed=cfg.sim.seed,
+        step_ms=cfg.sim.synthetic_step_ms,
+        book_every=cfg.sim.synthetic_book_every,
+        planted_edges=not args.null_market,
+    )
+    events = list(load_events(args.data) if args.data else m.events())
+    if args.data:
+        t0 = events[0].ts
+    res = run_tournament(
+        cfg,
+        events,
+        t0,
+        train_ms,
+        hold_ms,
+        top_k=args.top,
+        population_size=args.population,
+        generation_bars=args.generation_bars,
+    )
+    res.save(args.out)
+    print(
+        f"train: {res.train_generations} generations, {res.train_population_born} genomes born; "
+        f"{len(res.champions)} selected; train->holdout fitness degradation {res.degradation():+.3f} "
+        f"({res.elapsed_s:.0f}s)"
+    )
+    print(f"{'genome':14} {'species':38} {'train fit':>9} {'hold fit':>9} {'hold ret':>9} {'trades':>6}")
+    for c in res.champions:
+        print(
+            f"{c.genome_id:14} {c.species[:38]:38} {c.train.get('fitness', float('nan')):9.3f} "
+            f"{c.holdout['fitness']:9.3f} {c.holdout['net_return'] * 100:8.2f}% {int(c.holdout['trades']):6}"
+        )
+    print(f"saved {args.out}  (use: darwin run --seed-genomes {args.out})")
+    return 0
+
+
+def cmd_bench(args: argparse.Namespace) -> int:
+    args.mode = Mode.REPLAY.value
+    cfg = _config(args)
+    seeds = list(range(args.first_seed, args.first_seed + args.seeds))
+    rows, summaries = run_bench(cfg, seeds, args.hours, planted=not args.null_market)
+    print(
+        f"{'allocator':18} {'runs':>4} {'mean final':>11} {'median':>9} {'mean logG':>10} {'mean maxDD':>10} "
+        f"{'Δ vs equal':>11} {'t':>6} {'wins':>5}"
+    )
+    for s in summaries:
+        print(
+            f"{s.allocator:18} {s.runs:4} {s.mean_final:11.2f} {s.median_final:9.2f} "
+            f"{s.mean_log_growth:10.4f} {s.mean_max_drawdown:10.3f} {s.paired_vs_baseline_mean:+11.4f} "
+            f"{s.paired_vs_baseline_t:6.2f} {s.wins_vs_baseline:5}"
+        )
+    if args.json:
+        Path(args.json).write_text(
+            json.dumps(
+                {"rows": [r.__dict__ for r in rows], "summary": [s.__dict__ for s in summaries]}, indent=2
+            )
+        )
+    return 0
+
+
 def cmd_explain(args: argparse.Namespace) -> int:
     cfg = _config(args)
     store = AuditStore(cfg.persistence.database_url, run_id=args.run or "?")
@@ -177,7 +252,11 @@ def cmd_explain(args: argparse.Namespace) -> int:
         if iid is None:
             print("no decision found", file=sys.stderr)
             return 1
-    ex = explain(store, iid)
+    try:
+        ex = explain(store, iid, run_id=args.run)
+    except AmbiguousIntent as e:
+        print(str(e), file=sys.stderr)
+        return 2
     if ex is None:
         print("unknown intent", file=sys.stderr)
         return 1
@@ -251,6 +330,7 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--run-id")
     r.add_argument("--no-api", action="store_true")
     r.add_argument("--keep-api", action="store_true", help="keep serving the dashboard after the end")
+    r.add_argument("--seed-genomes", help="champion set JSON from `darwin evolve`")
     r.set_defaults(fn=cmd_run)
 
     rp = sub.add_parser("replay", help="fast deterministic replay on synthetic data")
@@ -260,6 +340,26 @@ def main(argv: list[str] | None = None) -> int:
     rp.add_argument("--null-market", action="store_true", help="random walk without planted structure")
     rp.add_argument("--no-db", action="store_true")
     rp.set_defaults(fn=cmd_replay)
+
+    ev = sub.add_parser("evolve", help="offline accelerated evolution: train -> holdout -> champion set")
+    ev.add_argument("--train-hours", type=float, default=72)
+    ev.add_argument("--holdout-hours", type=float, default=24)
+    ev.add_argument("--population", type=int, default=48)
+    ev.add_argument("--generation-bars", type=int, default=120)
+    ev.add_argument("--top", type=int, default=8)
+    ev.add_argument("--seed", type=int)
+    ev.add_argument("--data", help="recorded parquet run directory instead of synthetic data")
+    ev.add_argument("--null-market", action="store_true")
+    ev.add_argument("--out", default="champions.json")
+    ev.set_defaults(fn=cmd_evolve)
+
+    b = sub.add_parser("bench-allocators", help="paired benchmark: equal vs fitness-weighted vs Thompson")
+    b.add_argument("--seeds", type=int, default=5)
+    b.add_argument("--first-seed", type=int, default=100)
+    b.add_argument("--hours", type=float, default=48)
+    b.add_argument("--null-market", action="store_true")
+    b.add_argument("--json", help="write rows + summary to this file")
+    b.set_defaults(fn=cmd_bench)
 
     e = sub.add_parser("explain", help="why did an agent take a decision?")
     e.add_argument("--run")

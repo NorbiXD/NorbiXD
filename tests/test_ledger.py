@@ -79,8 +79,9 @@ def test_funding_distributed_by_agent_position() -> None:
     acct = led.open_account("acc", "challenge", 1_000.0)
     fill(led, Side.BUY, 2.0, 100.0, 1, "I1", agent="A1", fee=0.0)
     fill(led, Side.SELL, 1.0, 100.0, 1, "I2", agent="A2", fee=0.0)
-    total = led.on_funding("acc", "BTCUSDT", 0.001, 100.0)
-    assert total == pytest.approx(0.1)  # net 1.0 long * 100 * 0.001
+    cash0 = acct.cash
+    residual = led.on_funding("acc", "BTCUSDT", 0.001, 100.0)
+    assert residual == 0.0 and cash0 - acct.cash == pytest.approx(0.1)  # net 1.0 long * 100 * 0.001
     assert acct.pos("A1", "BTCUSDT").funding == pytest.approx(0.2)
     assert acct.pos("A2", "BTCUSDT").funding == pytest.approx(-0.1)
     assert acct.net_qty("BTCUSDT") == pytest.approx(1.0)

@@ -78,8 +78,8 @@ lineage = Table(
 snapshots = Table(
     "snapshots",
     metadata,
+    Column("run_id", String(64), primary_key=True),
     Column("snapshot_id", String(96), primary_key=True),
-    Column("run_id", String(64), index=True),
     Column("ts", BigInteger),
     Column("symbol", String(32)),
     Column("data", JSON),
@@ -88,8 +88,8 @@ snapshots = Table(
 intents = Table(
     "intents",
     metadata,
+    Column("run_id", String(64), primary_key=True),
     Column("intent_id", String(32), primary_key=True),
-    Column("run_id", String(64), index=True),
     Column("ts", BigInteger),
     Column("agent_id", String(32)),
     Column("genome_id", String(32)),
@@ -117,8 +117,8 @@ intents = Table(
 risk_decisions = Table(
     "risk_decisions",
     metadata,
+    Column("run_id", String(64), primary_key=True),
     Column("decision_id", String(32), primary_key=True),
-    Column("run_id", String(64), index=True),
     Column("intent_id", String(32), index=True),
     Column("account_id", String(64)),
     Column("agent_id", String(32)),
@@ -142,8 +142,8 @@ risk_decisions = Table(
 orders = Table(
     "orders",
     metadata,
+    Column("run_id", String(64), primary_key=True),
     Column("client_order_id", String(40), primary_key=True),
-    Column("run_id", String(64), index=True),
     Column("decision_id", String(32), index=True),
     Column("intent_id", String(32), index=True),
     Column("account_id", String(64)),
@@ -168,8 +168,8 @@ orders = Table(
 fills = Table(
     "fills",
     metadata,
+    Column("run_id", String(64), primary_key=True),
     Column("exec_id", String(64), primary_key=True),
-    Column("run_id", String(64), index=True),
     Column("client_order_id", String(40), index=True),
     Column("account_id", String(64)),
     Column("agent_id", String(32)),
@@ -187,8 +187,8 @@ fills = Table(
 trades = Table(
     "trades",
     metadata,
+    Column("run_id", String(64), primary_key=True),
     Column("trade_id", String(32), primary_key=True),
-    Column("run_id", String(64), index=True),
     Column("account_id", String(64), index=True),
     Column("agent_id", String(32), index=True),
     Column("genome_id", String(32)),
@@ -261,8 +261,8 @@ equity = Table(
 signals = Table(
     "signals",
     metadata,
+    Column("run_id", String(64), primary_key=True),
     Column("signal_id", String(128), primary_key=True),
-    Column("run_id", String(64), index=True),
     Column("ts", BigInteger, index=True),  # availability time (when the system received it)
     Column("observed_ts", BigInteger, nullable=True),
     Column("source", String(64)),
@@ -286,9 +286,9 @@ system_events = Table(
 )
 
 UPSERT_KEYS: dict[str, tuple[str, ...]] = {
-    "signals": ("signal_id",),
+    "signals": ("run_id", "signal_id"),
     "agents": ("run_id", "agent_id"),
-    "orders": ("client_order_id",),
+    "orders": ("run_id", "client_order_id"),
     "genomes": ("genome_id",),
     "runs": ("run_id",),
 }

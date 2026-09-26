@@ -31,13 +31,26 @@ class SymbolState:
     last_ticker_ts: int = 0
     seen_trade_ids: dict[str, None] = field(default_factory=dict)
     duplicate_trades: int = 0
+    max_price_age_ms: int = 5_000
 
-    def ref_price(self) -> float | None:
-        """Best available fair price: mark, then mid, then last trade."""
-        if self.mark_price:
-            return self.mark_price
+    def ref_price(self, now: int | None = None) -> float | None:
+        """Best *fresh* fair price: mark, then book mid, then last trade.
+
+        With ``now`` given, a source older than ``max_price_age_ms`` is skipped — a mark from a
+        ticker stream that went quiet must never size an order. Returns None if nothing is fresh.
+        Without ``now`` (venue-side use) the latest known value is returned.
+        """
         mid = self.book.mid() if self.book.valid else None
-        return mid or self.last_price
+        if now is None:
+            return self.mark_price or mid or self.last_price
+        age = self.max_price_age_ms
+        if self.mark_price and now - self.last_ticker_ts <= age:
+            return self.mark_price
+        if mid and now - self.book.last_ts <= age:
+            return mid
+        if self.last_price and now - self.last_trade_ts <= age:
+            return self.last_price
+        return None
 
     def last_update_ts(self) -> int:
         return max(self.book.last_ts, self.last_trade_ts, self.last_ticker_ts)
@@ -48,9 +61,9 @@ class SymbolState:
     def is_stale(self, now: int, max_age_ms: int) -> bool:
         if not self.book.valid:
             return True
-        if self.ref_price() is None:
+        if now - max(self.book.last_ts, self.last_trade_ts) > max_age_ms:
             return True
-        return now - max(self.book.last_ts, self.last_trade_ts) > max_age_ms
+        return self.ref_price(now) is None
 
 
 class MarketState:
@@ -58,9 +71,18 @@ class MarketState:
 
     _TRADE_ID_MEMORY = 5_000
 
-    def __init__(self, symbols: tuple[str, ...] | list[str], strict_sequence: bool = True) -> None:
+    def __init__(
+        self,
+        symbols: tuple[str, ...] | list[str],
+        strict_sequence: bool = True,
+        max_price_age_ms: int = 5_000,
+    ) -> None:
         self.symbols: dict[str, SymbolState] = {
-            s: SymbolState(symbol=s, book=OrderBook(symbol=s, strict_sequence=strict_sequence))
+            s: SymbolState(
+                symbol=s,
+                book=OrderBook(symbol=s, strict_sequence=strict_sequence),
+                max_price_age_ms=max_price_age_ms,
+            )
             for s in symbols
         }
 

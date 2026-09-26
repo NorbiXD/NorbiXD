@@ -82,7 +82,7 @@ class BarBuilder:
             self.liq_short += notional
 
     def close_bar(self, start_ts: int, end_ts: int, st: SymbolState, stale: bool) -> Bar | None:
-        ref = st.ref_price()
+        ref = st.ref_price(end_ts)
         if self.close is None:
             px = ref if ref is not None else self.prev_close
             if px is None:
@@ -108,7 +108,7 @@ class BarBuilder:
             sell_volume=self.sell_volume,
             n_trades=self.n_trades,
             vwap=vwap,
-            mark_price=st.mark_price or c,
+            mark_price=ref or c,
             funding_rate=st.funding_rate or 0.0,
             open_interest=st.open_interest or 0.0,
             book_imbalance=imb if imb is not None else 0.0,

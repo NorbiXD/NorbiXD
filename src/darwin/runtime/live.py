@@ -137,8 +137,16 @@ class LiveDriver:
             return
         while not self.stop.is_set():
             await asyncio.sleep(self.flush_interval_s)
-            if store.pending():
-                await asyncio.to_thread(store.flush)
+            if not store.pending():
+                continue
+            try:
+                await asyncio.to_thread(store.flush)  # a failed batch is requeued by the store
+            except Exception as e:  # keep flushing; the engine halts new risk meanwhile
+                with self.engine.lock:
+                    self.engine.audit_flush_failed(repr(e))
+            else:
+                with self.engine.lock:
+                    self.engine.audit_flush_ok()
 
     async def run(self) -> float:
         eng = self.engine

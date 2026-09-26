@@ -49,13 +49,15 @@ class Evaluation:
     agent_id: str
     generation: int
     ts: int
-    report: FitnessReport
-    adjusted_fitness: float
+    report: FitnessReport  # own window: [max(now - eval window, born), now]
+    adjusted_fitness: float  # window-matched relative fitness, correlation-penalised (selection metric)
     eligible: bool
-    excess_t: float
+    excess_t: float  # paired t-stat of bar returns vs cohort median on identical bars
     max_corr: float
     age_generations: int
     rank: int = 0
+    relative_fitness: float = 0.0  # fitness - cohort median fitness on the *same* window
+    cohort_median: float = 0.0
 
     def to_record(self) -> dict[str, Any]:
         return {
@@ -64,6 +66,8 @@ class Evaluation:
             "ts": self.ts,
             "fitness": self.report.fitness,
             "adjusted_fitness": self.adjusted_fitness,
+            "relative_fitness": self.relative_fitness,
+            "cohort_median": self.cohort_median,
             "eligible": self.eligible,
             "excess_t": self.excess_t,
             "max_corr": self.max_corr,
@@ -172,10 +176,24 @@ class Population:
         return out
 
     # ------------------------------------------------------------------ seeding
-    def seed(self, ts: int) -> list[Agent]:
-        """Initial population: every seed species represented, remainder random."""
+    def seed(
+        self, ts: int, genomes: list[tuple[Genome, str]] | None = None, fill: bool = True
+    ) -> list[Agent]:
+        """Initial population.
+
+        ``genomes`` (genome, origin) are placed first — e.g. a champion set from offline
+        evolution (``darwin evolve``) or sandbox-validated species. With ``fill`` the rest of
+        the population is random, covering every seed species.
+        """
         self.generation_start_ts = ts
         born: list[Agent] = []
+        for g, origin in genomes or []:
+            if any(a.genome.genome_id == g.genome_id for a in born):
+                continue
+            self.genome_origin[g.genome_id] = origin
+            born.append(self._new_agent(g, ts, LineageEventKind.BORN, details={"origin": origin}))
+        if not fill:
+            return born
         species = [s for s in self.cfg.seed_species if s in PRIMITIVES]
         i = 0
         while len(born) < self.cfg.population_size:
@@ -223,30 +241,47 @@ class Population:
         return ts[1:], np.diff(np.log(np.maximum(eq, 1e-9)))
 
     # ------------------------------------------------------------------ evaluation
+    def _window_fitness(self, agent_id: str, start: int, now: int, seed: str) -> FitnessReport:
+        b = self.books[agent_id]
+        ts = np.asarray(b.ts, dtype=np.int64)
+        eq = np.asarray(b.equity, dtype=float)
+        m = ts >= start
+        trades = [t for t in b.trades if t.exit_ts >= start]
+        return compute_fitness(
+            eq[m],
+            trades,
+            window_ms=max(now - start, self.bar_ms),
+            settings=self.cfg.fitness,
+            horizon_days=self.horizon_days,
+            seed_key=seed,
+        )
+
     def evaluate(self, now: int) -> dict[str, Evaluation]:
+        """Evaluate every alive agent.
+
+        Absolute fitness is measured on each agent's own window. Because agents born in
+        different generations have windows of different length (and therefore different
+        regimes), *selection* uses window-matched relative fitness: an agent's fitness minus the
+        median fitness of every agent that was alive over exactly the same bars. Births happen
+        only at generation boundaries, so there are at most ``eval_generations + 1`` distinct
+        windows and the benchmark cost is O(windows x agents).
+        """
         cfg = self.cfg
         window_ms = cfg.eval_generations * cfg.generation_bars * self.bar_ms
         since = now - window_ms
         alive = self.alive
-        rets: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-        reports: dict[str, FitnessReport] = {}
-        for a in alive:
-            b = self.books[a.agent_id]
-            start = max(since, a.born_ts)
-            ts = np.asarray(b.ts, dtype=np.int64)
-            eq = np.asarray(b.equity, dtype=float)
-            m = ts >= start
-            trades = [t for t in b.trades if t.exit_ts >= start]
-            reports[a.agent_id] = compute_fitness(
-                eq[m],
-                trades,
-                window_ms=max(now - start, self.bar_ms),
-                settings=cfg.fitness,
-                horizon_days=self.horizon_days,
-                seed_key=f"{a.agent_id}:{self.generation}",
-            )
-            rets[a.agent_id] = self.returns(a.agent_id, start)
-
+        starts = {a.agent_id: max(since, a.born_ts) for a in alive}
+        rets = {a.agent_id: self.returns(a.agent_id, starts[a.agent_id]) for a in alive}
+        # fitness of every agent on every distinct window it fully covers
+        by_window: dict[int, dict[str, FitnessReport]] = {}
+        for w_start in sorted(set(starts.values())):
+            cohort = [a for a in alive if a.born_ts <= w_start]
+            by_window[w_start] = {
+                a.agent_id: self._window_fitness(
+                    a.agent_id, w_start, now, f"{a.agent_id}:{self.generation}:{w_start}"
+                )
+                for a in cohort
+            }
         # cohort median return per bar (paired, window-matched comparison)
         by_ts: dict[int, list[float]] = {}
         for ts_arr, r_arr in rets.values():
@@ -256,27 +291,32 @@ class Population:
 
         evals: dict[str, Evaluation] = {}
         for a in alive:
+            w = by_window[starts[a.agent_id]]
+            rep = w[a.agent_id]
+            cohort_med = float(np.median([r.fitness for r in w.values()]))
             ts_arr, r_arr = rets[a.agent_id]
             med = np.array([median[t] for t in ts_arr.tolist()], dtype=float)
             excess_t = paired_t_stat(r_arr, med) if r_arr.size else 0.0
             # completed generations lived, measured in time so mid-generation calls agree
             age = int((now - a.born_ts) // (cfg.generation_bars * self.bar_ms))
-            rep = reports[a.agent_id]
             eligible = rep.n_trades >= cfg.min_trades and age >= cfg.min_age_generations
+            rel = rep.fitness - cohort_med
             evals[a.agent_id] = Evaluation(
                 agent_id=a.agent_id,
                 generation=self.generation,
                 ts=now,
                 report=rep,
-                adjusted_fitness=rep.fitness,
+                adjusted_fitness=rel,
                 eligible=eligible,
                 excess_t=excess_t,
                 max_corr=0.0,
                 age_generations=age,
+                relative_fitness=rel,
+                cohort_median=cohort_med,
             )
 
         # fitness sharing: penalise correlation with better-ranked eligible agents
-        ranked = sorted((e for e in evals.values() if e.eligible), key=lambda e: -e.report.fitness)
+        ranked = sorted((e for e in evals.values() if e.eligible), key=lambda e: -e.relative_fitness)
         kept: list[Evaluation] = []
         for e in ranked:
             mc = 0.0
@@ -285,7 +325,7 @@ class Population:
             e.max_corr = mc
             thr = cfg.correlation_threshold
             pen = cfg.correlation_penalty * max(0.0, (mc - thr) / (1 - thr))
-            e.adjusted_fitness = e.report.fitness - abs(e.report.fitness) * pen
+            e.adjusted_fitness = e.relative_fitness - abs(e.relative_fitness) * pen
             kept.append(e)
         order = sorted(evals.values(), key=lambda e: (not e.eligible, -e.adjusted_fitness))
         for i, e in enumerate(order, 1):
@@ -348,7 +388,7 @@ class Population:
             if not a.alive:
                 continue
             inferior = e.agent_id in bottom and e.excess_t < -cfg.kill_t_stat
-            if inferior and a.agent_id != self.champion_id:
+            if inferior:  # the champion is not immune: a degraded champion is demoted too
                 a.strikes += 1
                 details = {
                     "strikes": a.strikes,
@@ -414,24 +454,30 @@ class Population:
             lineage=list(self.lineage),
         )
 
+    def _qualified(self, e: Evaluation) -> bool:
+        """Parent / champion / capital eligible: beats the cohort on identical bars (relative),
+        has an absolute edge after risk penalties, and an acceptable ruin probability."""
+        return (
+            e.eligible
+            and self.agents[e.agent_id].status is AgentStatus.ALIVE
+            and e.adjusted_fitness > 0
+            and e.report.fitness > 0
+            and e.report.ruin_prob <= self.cfg.max_ruin_prob_parent
+        )
+
     def _update_champion(self, evals: dict[str, Evaluation], now: int) -> bool:
         cfg = self.cfg
-        cands = [
-            e
-            for e in evals.values()
-            if e.eligible
-            and self.agents[e.agent_id].status is AgentStatus.ALIVE
-            and e.report.ruin_prob <= cfg.max_ruin_prob_parent
-            and e.adjusted_fitness > 0
-        ]
+        cur = self.champion_id
+        cur_ok = cur is not None and self.agents[cur].status is AgentStatus.ALIVE and cur in evals
+        cands = [e for e in evals.values() if self._qualified(e)]
         if not cands:
-            if self.champion_id and not self.agents[self.champion_id].alive:
-                self.champion_id = None
+            if cur is not None and not cur_ok:
+                self.champion_id = None  # dead or demoted champions lose the title
                 return True
             return False
         best = max(cands, key=lambda e: e.adjusted_fitness)
-        cur = self.champion_id
-        if cur is not None and self.agents[cur].alive and cur in evals and cur != best.agent_id:
+        if cur_ok and cur != best.agent_id:
+            assert cur is not None
             ce = evals[cur]
             since = max(self.agents[cur].born_ts, self.agents[best.agent_id].born_ts)
             _, rc = self.returns(cur, since)
@@ -469,19 +515,15 @@ class Population:
         if slots <= 0:
             return []
         born: list[Agent] = []
-        pool = [
-            e
-            for e in evals.values()
-            if e.eligible
-            and self.agents[e.agent_id].status is AgentStatus.ALIVE
-            and e.adjusted_fitness > 0
-            and e.report.ruin_prob <= cfg.max_ruin_prob_parent
-        ]
+        pool = [e for e in evals.values() if self._qualified(e)]
         pool.sort(key=lambda e: -e.adjusted_fitness)
         n_elite = max(1, math.ceil(len(pool) * cfg.elite_fraction)) if pool else 0
         parents = pool[: max(n_elite, min(len(pool), cfg.tournament_size))]
-        n_imm = min(slots, max(1, round(cfg.immigrant_rate * cfg.population_size)))
-        if not parents:
+        if parents:
+            # exploration is a fraction of the free slots, never all of them: when parents
+            # qualify at least one slot always goes to offspring
+            n_imm = min(slots - 1, max(1 if slots >= 3 else 0, round(cfg.immigrant_rate * slots)))
+        else:
             n_imm = slots  # nobody has earned the right to reproduce: explore instead
         existing = {a.genome.genome_id for a in self.alive}
         species_count = Counter(a.species for a in self.alive)

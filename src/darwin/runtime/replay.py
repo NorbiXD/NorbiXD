@@ -18,6 +18,7 @@ import itertools
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 
+from darwin.agents.genome import Genome
 from darwin.config.challenge import ChallengeConfig
 from darwin.core.events import Event, TimerEvent
 from darwin.exchange.scheduler import EventTarget
@@ -125,8 +126,11 @@ def build_replay(
     store: AuditStore | None = None,
     run_id: str = "replay",
     chaos: Chaos | None = None,
+    shadow_chaos: Chaos | None = None,
     timer_ms: int = 5_000,
     intelligence: bool = False,
+    seed_genomes: list[tuple[Genome, str]] | None = None,
+    fill: bool = True,
 ) -> ReplayHandles:
     engine = DarwinEngine(cfg, run_id=run_id, start_ts=start_ts, store=store)
     driver = ReplayDriver(engine, market, [], timer_ms=timer_ms)
@@ -147,10 +151,10 @@ def build_replay(
         "engine": engine,
         "maintenance_margin_rate": cfg.risk.maintenance_margin_rate,
     }
-    shadow = SimExchange(SHADOW_VENUE, seed_offset=1, **common)  # type: ignore[arg-type]
+    shadow = SimExchange(SHADOW_VENUE, seed_offset=1, chaos=shadow_chaos, **common)  # type: ignore[arg-type]
     challenge = SimExchange(CHALLENGE_VENUE, seed_offset=2, chaos=chaos, **common)  # type: ignore[arg-type]
     driver.venues = [shadow, challenge]
     engine.attach_gateway(SHADOW_VENUE, shadow)
     engine.attach_gateway(CHALLENGE_VENUE, challenge)
-    engine.start()
+    engine.start(seed_genomes, fill)
     return ReplayHandles(engine=engine, driver=driver, shadow=shadow, challenge=challenge)

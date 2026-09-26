@@ -32,6 +32,7 @@ DEFINITIVE_REJECT_CODES = {
 }
 DUPLICATE_LINK_ID = 110072  # orderLinkId is duplicate => the earlier attempt reached the exchange
 LEVERAGE_NOT_MODIFIED = 110043
+POSITION_MODE_NOT_MODIFIED = 110025
 
 
 class BybitApiError(Exception):
@@ -163,6 +164,19 @@ class BybitRest:
         res = await self._request("GET", "/v5/account/wallet-balance", {"accountType": "UNIFIED"})
         rows = res.get("list", [])
         return rows[0] if rows else None
+
+    async def account_info(self) -> dict[str, Any]:
+        res: dict[str, Any] = await self._request("GET", "/v5/account/info", {})
+        return res
+
+    async def set_one_way_mode(self, coin: str = "USDT") -> None:
+        try:
+            await self._request(
+                "POST", "/v5/position/switch-mode", {"category": "linear", "coin": coin, "mode": 0}
+            )
+        except BybitApiError as e:
+            if e.ret_code != POSITION_MODE_NOT_MODIFIED:
+                raise
 
     async def set_leverage(self, symbol: str, leverage: float) -> None:
         lev = f"{leverage:g}"

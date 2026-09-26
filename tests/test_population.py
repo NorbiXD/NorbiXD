@@ -13,17 +13,17 @@ SYMS = ("BTCUSDT",)
 
 
 def make_pop(**kw: object) -> Population:
-    cfg = EvolutionSettings(
-        population_size=10,
-        generation_bars=100,
-        min_trades=5,
-        min_age_generations=1,
-        kill_fraction=0.3,
-        kill_t_stat=1.0,
-        max_strikes=2,
-        immigrant_rate=0.1,
-        **kw,
-    )  # type: ignore[arg-type]
+    base: dict[str, object] = {
+        "population_size": 10,
+        "generation_bars": 100,
+        "min_trades": 5,
+        "min_age_generations": 1,
+        "kill_fraction": 0.3,
+        "kill_t_stat": 1.0,
+        "max_strikes": 2,
+        "immigrant_rate": 0.1,
+    }
+    cfg = EvolutionSettings(**{**base, **kw})  # type: ignore[arg-type]
     return Population(cfg, SYMS, BAR, horizon_days=7, seed=1)
 
 

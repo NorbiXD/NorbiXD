@@ -255,7 +255,7 @@ class Ledger:
                 rt.exit_intent_id = intent_id
                 rt.exit_reason = intent_reason
                 closed.append(rt)
-                self.closed_trades.append(rt)
+                self.closed_trades.append(rt)  # cleared by the engine every bar
                 del self.open_trades[key]
                 rt = None
         if opening_qty > EPS:
@@ -286,21 +286,26 @@ class Ledger:
             rt.entry_notional = max(rt.entry_notional, abs(pos.qty) * pos.avg_price)
         return closed
 
-    def on_funding(self, account_id: str, symbol: str, rate: float, mark: float) -> float:
-        """Distribute a funding settlement to agent sub-positions. Returns total paid."""
+    def on_funding(
+        self, account_id: str, symbol: str, rate: float, mark: float, amount: float | None = None
+    ) -> float:
+        """Apply a funding settlement. Agent shares are ``qty * mark * rate``; if the venue reports
+        the actual ``amount`` the account is charged exactly that, and any difference (e.g. a
+        fill in flight at settlement) is returned as the unattributed residual."""
         acct = self.accounts[account_id]
         total = 0.0
         for (agent_id, s), p in acct.positions.items():
             if s != symbol or p.qty == 0:
                 continue
-            amount = p.qty * mark * rate
-            p.funding += amount
-            acct.cash -= amount
-            total += amount
+            share = p.qty * mark * rate
+            p.funding += share
+            total += share
             rt = self.open_trades.get((account_id, agent_id, symbol))
             if rt is not None:
-                rt.funding += amount
-        return total
+                rt.funding += share
+        charged = total if amount is None else amount
+        acct.cash -= charged
+        return charged - total
 
     def liquidation_allocation(self, account_id: str, symbol: str, side: Side) -> list[tuple[str, float]]:
         """Which agents a venue liquidation fill on ``symbol`` belongs to (pro rata by size)."""

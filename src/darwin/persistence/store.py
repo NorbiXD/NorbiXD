@@ -51,7 +51,10 @@ class AuditStore:
         self._rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
         self._upserts: dict[str, dict[tuple[Any, ...], dict[str, Any]]] = defaultdict(dict)
         self._lock = threading.Lock()
+        self._flush_lock = threading.Lock()
         self.rows_written = 0
+        self.failures = 0
+        self.last_error: str | None = None
 
     # ------------------------------------------------------------------ writes
     def add(self, table: str, row: dict[str, Any]) -> None:
@@ -71,24 +74,38 @@ class AuditStore:
             return sum(len(v) for v in self._rows.values()) + sum(len(v) for v in self._upserts.values())
 
     def flush(self) -> int:
-        with self._lock:
-            rows, self._rows = self._rows, defaultdict(list)
-            ups, self._upserts = self._upserts, defaultdict(dict)
-        n = 0
-        with self.engine.begin() as conn:
-            for name, batch in rows.items():
-                if batch:
-                    tbl = schema.metadata.tables[name]
-                    conn.execute(insert(tbl), batch)
-                    n += len(batch)
-            for name, by_key in ups.items():
-                if by_key:
-                    tbl = schema.metadata.tables[name]
-                    for row in by_key.values():
-                        conn.execute(self._upsert_stmt(tbl, row))
-                    n += len(by_key)
-        self.rows_written += n
-        return n
+        """Write buffered rows in one transaction. On failure the batch is put back (nothing is
+        silently dropped) and the error propagates so the caller can halt new risk."""
+        with self._flush_lock:
+            with self._lock:
+                rows, self._rows = self._rows, defaultdict(list)
+                ups, self._upserts = self._upserts, defaultdict(dict)
+            n = 0
+            try:
+                with self.engine.begin() as conn:
+                    for name, batch in rows.items():
+                        if batch:
+                            conn.execute(insert(schema.metadata.tables[name]), batch)
+                            n += len(batch)
+                    for name, by_key in ups.items():
+                        if by_key:
+                            tbl = schema.metadata.tables[name]
+                            for row in by_key.values():
+                                conn.execute(self._upsert_stmt(tbl, row))
+                            n += len(by_key)
+            except Exception as e:
+                with self._lock:  # requeue ahead of anything buffered meanwhile
+                    for name, batch in rows.items():
+                        self._rows[name] = batch + self._rows[name]
+                    for name, by_key in ups.items():
+                        merged = dict(by_key)
+                        merged.update(self._upserts[name])
+                        self._upserts[name] = merged
+                self.failures += 1
+                self.last_error = repr(e)
+                raise
+            self.rows_written += n
+            return n
 
     def _upsert_stmt(self, tbl: Table, row: dict[str, Any]) -> Any:
         keys = schema.UPSERT_KEYS[tbl.name]

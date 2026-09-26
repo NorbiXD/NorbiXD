@@ -55,14 +55,14 @@ risk:
 evolution:
   population_size: 24
   generation_bars: 240         # 4 hours per generation at 1-minute bars
-  eval_generations: 3
+  eval_generations: 6          # evaluation window must span regimes (24h)
   eval_capital: 1000.0         # standardized shadow-book capital (scale-free fitness)
   min_trades: 6
   min_age_generations: 1
   kill_fraction: 0.25
   kill_t_stat: 1.0
   max_strikes: 2
-  max_inactive_generations: 3
+  max_inactive_generations: 6
   elite_fraction: 0.25
   crossover_rate: 0.3
   immigrant_rate: 0.15

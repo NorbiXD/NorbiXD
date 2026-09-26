@@ -149,8 +149,10 @@ class FitnessSettings(_Frozen):
 class EvolutionSettings(_Frozen):
     population_size: int = Field(default=24, ge=4)
     generation_bars: int = Field(default=240, ge=10)
-    #: fitness is measured over the most recent N generations of each agent's life
-    eval_generations: int = Field(default=3, ge=1)
+    #: fitness is measured over the most recent N generations of each agent's life. The window
+    #: must span several market regimes (default 6 x 240 bars = 24h): with a 6h window evolution
+    #: killed trend followers during range regimes and never found a planted trend edge.
+    eval_generations: int = Field(default=6, ge=1)
     max_ruin_prob_parent: float = Field(default=0.5, ge=0, le=1)
     eval_capital: float = Field(default=1_000.0, gt=0)
     min_trades: int = Field(default=6, ge=1)
@@ -158,7 +160,7 @@ class EvolutionSettings(_Frozen):
     kill_fraction: float = Field(default=0.25, gt=0, lt=1)
     kill_t_stat: float = Field(default=1.0, ge=0)
     max_strikes: int = Field(default=2, ge=1)
-    max_inactive_generations: int = Field(default=3, ge=1)
+    max_inactive_generations: int = Field(default=6, ge=1)
     elite_fraction: float = Field(default=0.25, gt=0, le=1)
     tournament_size: int = Field(default=3, ge=2)
     crossover_rate: float = Field(default=0.3, ge=0, le=1)

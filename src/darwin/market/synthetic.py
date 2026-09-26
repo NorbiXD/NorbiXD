@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from darwin.core.events import (
+    BookDelta,
     BookSnapshot,
     FundingSettlement,
     LiquidationEvent,
@@ -80,6 +81,11 @@ class SyntheticMarket:
     imbalance_kappa: float = 0.03
     jump_rate_per_hour: float = 0.4
     chunk_steps: int = 3_600
+    #: emit incremental BookDelta updates (with a full snapshot every ``snapshot_every`` books)
+    book_deltas: bool = False
+    snapshot_every: int = 50
+    #: probability that a delta skips an update id (exercises gap detection / recovery)
+    gap_prob: float = 0.0
     profiles: dict[str, SymbolProfile] = field(default_factory=lambda: dict(DEFAULT_PROFILES))
     #: regime path actually generated, one entry per (ts, regime) change; for diagnostics/tests
     regime_log: list[tuple[int, str]] = field(default_factory=list)
@@ -131,6 +137,10 @@ class SyntheticMarket:
         corr = self.correlation
         mean_regime_steps = self.regime_mean_minutes * steps_per_min
 
+        book_count: dict[str, int] = {}
+        sym_uid: dict[str, int] = {}
+        last_levels: dict[str, tuple[dict[float, float], dict[float, float]]] = {}
+        gap_rng = np.random.default_rng(self.seed + 31_337)
         n = self.n_steps
         step = 0
         while step < n:
@@ -226,9 +236,29 @@ class SyntheticMarket:
                                 open_interest=float(oi[j]),
                             )
                         )
-                        events.append(
-                            self._book(ts, sym, prof, float(price[j]), float(imb[j]), vol_mult, update_id)
-                        )
+                        snap = self._book(ts, sym, prof, float(price[j]), float(imb[j]), vol_mult, update_id)
+                        if not self.book_deltas:
+                            events.append(snap)
+                            continue
+                        book_count[sym] = book_count.get(sym, 0) + 1
+                        uid = sym_uid.get(sym, 0) + 1
+                        if self.gap_prob and sym in last_levels and gap_rng.random() < self.gap_prob:
+                            uid += 1  # a lost message: the receiver must detect the gap
+                        sym_uid[sym] = uid
+                        new_lv = (dict(snap.bids), dict(snap.asks))
+                        if sym not in last_levels or book_count[sym] % self.snapshot_every == 0:
+                            events.append(snap.model_copy(update={"update_id": uid}))
+                        else:
+                            ob, oa = last_levels[sym]
+                            nb, na = new_lv
+                            db = tuple((p, q) for p, q in nb.items() if ob.get(p) != q) + tuple(
+                                (p, 0.0) for p in ob if p not in nb
+                            )
+                            da = tuple((p, q) for p, q in na.items() if oa.get(p) != q) + tuple(
+                                (p, 0.0) for p in oa if p not in na
+                            )
+                            events.append(BookDelta(ts=ts, symbol=sym, bids=db, asks=da, update_id=uid))
+                        last_levels[sym] = new_lv
                 # ---------------- trades (one aggregated print per symbol per step)
                 for j, sym in enumerate(syms):
                     prof = profs[j]
