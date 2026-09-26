@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 from collections import Counter, deque
 from collections.abc import Callable
 from typing import Any
@@ -48,7 +49,7 @@ from darwin.core.events import (
 )
 from darwin.core.ids import Sequence
 from darwin.core.intent import IntentReason, TradeIntent
-from darwin.core.types import AgentStatus, LineageEventKind, Mode
+from darwin.core.types import AgentStatus, LineageEventKind
 from darwin.evolution.allocator import AllocationCandidate, make_allocator
 from darwin.evolution.fitness import TradeSample
 from darwin.evolution.population import EvolutionResult, LineageEvent, Population
@@ -144,6 +145,8 @@ class DarwinEngine:
         self.recent_lineage: deque[dict[str, Any]] = deque(maxlen=300)
         self.venue_equity: float | None = None
         self.last_evolution: EvolutionResult | None = None
+        #: held by drivers while mutating and by API readers; uncontended in single-loop modes
+        self.lock = threading.RLock()
 
     # ------------------------------------------------------------------ wiring
     def attach_gateway(self, venue: str, gateway: ExecutionGateway) -> None:
@@ -229,17 +232,18 @@ class DarwinEngine:
         elif isinstance(ev, TimerEvent):
             self._on_timer(ev)
         elif isinstance(ev, FeedStatus):
-            self._system_event(
-                f"feed_{ev.status}", {"feed": ev.feed, "symbol": ev.symbol, "detail": ev.detail}
-            )
-            if ev.status == "disconnected":
-                self.health[CHALLENGE_VENUE].connected = self.cfg.challenge.mode in (
-                    Mode.REPLAY,
-                    Mode.SIM,
-                    Mode.PAPER,
-                )
-            elif ev.status == "connected":
-                self.health[CHALLENGE_VENUE].connected = True
+            self._on_feed_status(ev)
+
+    def _on_feed_status(self, ev: FeedStatus) -> None:
+        self._system_event(f"feed_{ev.status}", {"feed": ev.feed, "symbol": ev.symbol, "detail": ev.detail})
+        if ev.feed.startswith("public") and ev.status in ("disconnected", "stale", "gap"):
+            # never trade on a book we are no longer receiving updates for; the next snapshot
+            # after reconnect/resubscribe revalidates it
+            for sym, st in self.market.symbols.items():
+                if ev.symbol in (None, sym):
+                    st.book.invalidate(f"feed {ev.status}")
+        elif ev.feed.startswith("private"):
+            self.health[CHALLENGE_VENUE].connected = ev.status in ("connected", "resync")
 
     def advance_to(self, ts: int) -> None:
         """Close any bars that ended before ``ts`` (used by drivers at end of stream)."""
@@ -983,6 +987,7 @@ class DarwinEngine:
                     "genome_id": a.genome.genome_id,
                 }
             )
+
         def sort_key(r: dict[str, Any]) -> tuple[bool, float]:
             f = r["fitness"]
             return (r["status"] == AgentStatus.DEAD.value, -(float(f) if f is not None else -math.inf))

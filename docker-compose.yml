@@ -1,0 +1,27 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: darwin
+      POSTGRES_PASSWORD: darwin
+      POSTGRES_DB: darwin
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U darwin"]
+      interval: 3s
+      retries: 20
+
+  darwin:
+    build: .
+    depends_on:
+      postgres: {condition: service_healthy}
+    env_file: [.env]
+    environment:
+      DARWIN_DATABASE_URL: postgresql://darwin:darwin@postgres:5432/darwin
+    command: ["--config", "challenge.yaml", "run", "--mode", "sim", "--keep-api"]
+    ports: ["8000:8000"]
+    volumes: ["./challenge.yaml:/app/challenge.yaml:ro", "./data:/app/data"]
+
+volumes:
+  pgdata:

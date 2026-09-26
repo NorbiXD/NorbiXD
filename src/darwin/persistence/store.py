@@ -55,13 +55,13 @@ class AuditStore:
 
     # ------------------------------------------------------------------ writes
     def add(self, table: str, row: dict[str, Any]) -> None:
-        row.setdefault("run_id", self.run_id)
+        row = {"run_id": self.run_id, **row}  # copy: callers may keep references (e.g. read models)
         with self._lock:
             self._rows[table].append(row)
 
     def upsert(self, table: str, row: dict[str, Any]) -> None:
         if table != "genomes":
-            row.setdefault("run_id", self.run_id)
+            row = {"run_id": self.run_id, **row}
         key = tuple(row[k] for k in schema.UPSERT_KEYS[table])
         with self._lock:
             self._upserts[table][key] = row

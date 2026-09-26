@@ -77,35 +77,36 @@ class ReplayDriver:
             t_bar = eng.next_bar_ts
             choice = min((t_bar, -1), (t_mkt, 0), (t_heap, 1), (next_timer, 2))
             kind = choice[1]
-            if kind == -1:
-                eng.handle(TimerEvent(ts=t_bar, name="bar"))
-            elif kind == 0:
-                self._dispatch_market(pending)
-                self.last_ts = pending.ts
-                pending = next(self.market, None)
-            elif kind == 1:
-                _, _p, _s, target, ev = heapq.heappop(self._heap)
-                target.handle(ev)
-            else:
-                eng.handle(TimerEvent(ts=next_timer, name="heartbeat"))
-                next_timer += self.timer_ms
+            with eng.lock:
+                if kind == -1:
+                    eng.handle(TimerEvent(ts=t_bar, name="bar"))
+                elif kind == 0:
+                    self._dispatch_market(pending)
+                    self.last_ts = pending.ts
+                    pending = next(self.market, None)
+                elif kind == 1:
+                    _, _p, _s, target, ev = heapq.heappop(self._heap)
+                    target.handle(ev)
+                else:
+                    eng.handle(TimerEvent(ts=next_timer, name="heartbeat"))
+                    next_timer += self.timer_ms
             self.events += 1
             if store is not None and self.events % self.flush_every == 0:
                 store.flush()
         # end of stream: close the final bars (triggers challenge end + flattening), then drain
-        eng.advance_to(max(self.last_ts, eng.end_ts))
-        guard = 0
-        while self._heap and guard < 1_000_000:
-            t, _p, _s, target, ev = heapq.heappop(self._heap)
-            target.handle(ev)
-            self.events += 1
-            guard += 1
-            if not self._heap:
-                # let timers resolve any remaining timeouts, then drain again
-                eng.handle(
-                    TimerEvent(ts=max(t, eng.now) + eng.cfg.exchange.order_ack_timeout_ms, name="heartbeat")
-                )
-        return eng.finalize()
+        with eng.lock:
+            eng.advance_to(max(self.last_ts, eng.end_ts))
+            guard = 0
+            while self._heap and guard < 1_000_000:
+                t, _p, _s, target, ev = heapq.heappop(self._heap)
+                target.handle(ev)
+                self.events += 1
+                guard += 1
+                if not self._heap:
+                    # let timers resolve any remaining timeouts, then drain again
+                    hb = max(t, eng.now) + eng.cfg.exchange.order_ack_timeout_ms
+                    eng.handle(TimerEvent(ts=hb, name="heartbeat"))
+            return eng.finalize()
 
 
 @dataclass

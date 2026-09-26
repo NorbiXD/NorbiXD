@@ -1,0 +1,104 @@
+# DARWIN challenge configuration.
+#
+# The `risk` block is the operator's hard envelope. It is loaded once into an immutable object
+# owned by the Risk Governor; agents, evolution and LLM providers can neither read nor modify
+# it. Its fingerprint is stored with every run.
+
+challenge:
+  name: DARWIN-001
+  starting_capital: 200.0
+  duration_hours: 168          # fixed challenge duration
+  mode: sim                    # replay | sim | paper | testnet | live
+  live_enabled: false          # live ALSO needs DARWIN_LIVE_CONFIRM and BYBIT_API_KEY/SECRET
+  symbols: [BTCUSDT, ETHUSDT, SOLUSDT]
+  bar_ms: 60000                # decision clock: 1-minute bars
+  flatten_at_end: true
+
+exchange:
+  name: bybit
+  category: linear
+  fees: {taker_bps: 5.5, maker_bps: 2.0}
+  orderbook_depth: 50
+  order_ack_timeout_ms: 3000
+  reconcile_interval_ms: 15000
+
+sim:
+  seed: 7
+  latency: {min_ms: 20, max_ms: 120}
+  ack_latency: {min_ms: 5, max_ms: 40}
+  impact_bps_per_book: 2.0
+  synthetic_step_ms: 2000
+  synthetic_book_every: 3
+  speed: 120                   # sim mode: 1 hour of market per 30 seconds
+
+risk:
+  max_gross_leverage: 5.0      # gross notional of all agent sub-positions / equity
+  max_symbol_leverage: 3.0
+  max_agent_leverage: 5.0      # notional / agent's allocated capital
+  max_concurrent_positions: 8
+  min_liquidation_distance_pct: 0.06
+  maintenance_margin_rate: 0.005
+  max_drawdown_pct: 0.5        # circuit breaker from peak equity (halts new risk, flattens)
+  daily_loss_limit_pct: 0.35
+  flatten_on_breaker: true
+  max_data_staleness_ms: 5000
+  dedup_window_ms: 1500
+  max_orders_per_minute: 120
+  max_consecutive_api_errors: 5
+  require_stop_loss: true
+  min_stop_loss_pct: 0.002
+  max_stop_loss_pct: 0.10
+  max_slippage_bps: 50
+  allowed_symbols: [BTCUSDT, ETHUSDT, SOLUSDT, DOGEUSDT, XRPUSDT]
+  kill_switch_file: ./KILL     # `touch KILL` halts new risk and flattens the challenge account
+
+evolution:
+  population_size: 24
+  generation_bars: 240         # 4 hours per generation at 1-minute bars
+  eval_generations: 3
+  eval_capital: 1000.0         # standardized shadow-book capital (scale-free fitness)
+  min_trades: 6
+  min_age_generations: 1
+  kill_fraction: 0.25
+  kill_t_stat: 1.0
+  max_strikes: 2
+  max_inactive_generations: 3
+  elite_fraction: 0.25
+  crossover_rate: 0.3
+  immigrant_rate: 0.15
+  mutation_sigma: 0.15
+  structural_mutation_rate: 0.15
+  max_terms: 3
+  max_species_share: 0.4
+  correlation_threshold: 0.7
+  correlation_penalty: 0.5
+  champion_t_stat: 1.0
+  fitness:
+    gamma: 1.0                 # CRRA risk aversion: 1 = log utility (growth-optimal)
+    prior_trade_growth: -0.0005
+    prior_trade_sd: 0.004
+    min_trade_sd: 0.005
+    ruin_fraction: 0.3
+    weights: {growth: 1.0, terminal: 0.25, drawdown: 0.25, ruin: 1.0, consistency: 0.2, calibration: 0.2, slippage: 0.05}
+
+allocator:
+  kind: fitness_weighted       # fitness_weighted | thompson | equal
+  temperature: 1.0
+  max_weight: 0.4
+  max_funded_agents: 5
+  exploration_budget: 0.1
+  cash_buffer: 0.1
+  rebalance_bars: 60
+
+persistence:
+  database_url: sqlite:///./darwin.db   # docker compose sets DARWIN_DATABASE_URL=postgresql://...
+  parquet_dir: ./data
+
+api:
+  host: 127.0.0.1            # docker: set 0.0.0.0
+  port: 8000
+
+intelligence:
+  mock: {enabled: true}
+  jev: {enabled: false, base_url: https://api.typesafe.ai}
+  grok: {enabled: false, base_url: https://api.x.ai, interval_s: 900}
