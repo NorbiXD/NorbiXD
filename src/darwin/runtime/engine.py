@@ -82,6 +82,8 @@ def account_venue(account: str) -> str:
 
 
 class DarwinEngine:
+    RECONCILE_GRACE_MS = 5_000
+
     def __init__(
         self,
         cfg: ChallengeConfig,
@@ -140,6 +142,8 @@ class DarwinEngine:
         self.flat_confirmed: set[str] = set()
         self._last_exit_attempt: dict[tuple[str, str, str], int] = {}
         self.venue_positions: dict[str, float] = {}
+        self._last_fill_ts: dict[tuple[str, str], int] = {}
+        self._mismatches: dict[tuple[str, str], int] = {}
         self._last_flat_query = start_ts - 5_000
         self.last_reconcile_ts = start_ts
         self._last_prune = start_ts
@@ -742,6 +746,12 @@ class DarwinEngine:
             self._persist_agent(agent)
         for agent in res.born:
             self._on_birth(agent)
+        for aid in self.population.prune_books(ts):
+            # a long-dead agent's shadow account is flat and idle: release it (memory hygiene)
+            old_acct = shadow_account(aid)
+            if old_acct in self.ledger.accounts and self.is_flat(old_acct):
+                del self.ledger.accounts[old_acct]
+                self.execution.drop_account(old_acct)
         if res.champion_id and res.champion_id in self.population.agents:
             self._persist_agent(self.population.agents[res.champion_id])
         self._persist_lineage(self.population.drain_lineage())
@@ -842,6 +852,7 @@ class DarwinEngine:
 
     # ------------------------------------------------------------------ fills / reconciliation
     def _on_fill(self, ev: FillEvent) -> None:
+        self._last_fill_ts[(ev.account, ev.symbol)] = self.now
         mo, closed = self.execution.on_fill(ev)
         if mo is None and not closed:
             if self.execution.orphans and self.execution.orphans[-1].event is ev:
@@ -936,9 +947,16 @@ class DarwinEngine:
             self.venue_positions[ev.symbol] = ev.qty
         venue = account_venue(ev.account)
         h = self.health[venue]
-        # orders in flight make a transient mismatch legitimate
+        # orders in flight, or a fill in the last few seconds (the snapshot may predate it), make a
+        # transient mismatch legitimate; a real one must persist over two consecutive snapshots
+        key = (ev.account, ev.symbol)
         in_flight = self.execution.has_open(ev.account, ev.symbol)
-        if abs(internal - ev.qty) > step / 2 and not in_flight:
+        recent_fill = self.now - self._last_fill_ts.get(key, -(10**15)) < self.RECONCILE_GRACE_MS
+        mismatch = abs(internal - ev.qty) > step / 2
+        if mismatch and (in_flight or recent_fill):
+            return
+        self._mismatches[key] = self._mismatches.get(key, 0) + 1 if mismatch else 0
+        if mismatch and self._mismatches[key] >= 2:
             h.reconcile_ok = False
             h.reconcile_detail = f"{ev.account}:{ev.symbol} internal={internal} venue={ev.qty}"
             self.stats["reconcile_mismatch"] += 1
@@ -1258,7 +1276,7 @@ class DarwinEngine:
                     else None,
                     "fitness": round(e.adjusted_fitness, 4) if e else None,
                     "eligible": e.eligible if e else False,
-                    "trades": len(self.population.books[a.agent_id].trades),
+                    "trades": self.population.trade_count(a.agent_id),
                     "weight": self.weights.get(a.agent_id, 0.0),
                     "live_pnl": round(chal.agent_pnl(a.agent_id, marks), 4),
                     "strikes": a.strikes,

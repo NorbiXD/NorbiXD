@@ -255,3 +255,97 @@ def test_an_existing_run_id_is_refused_and_default_ids_are_unique(tmp_path: Any)
         build_replay(make_config(), iter([]), T0, store=AuditStore(url, "same"), run_id="same")
     ids = {new_run_id("sim") for _ in range(50)}
     assert len(ids) == 50 and all(i.startswith("sim-") for i in ids)
+
+
+# ----------------------------------------------------------------------------- minors
+
+
+def test_business_rejects_do_not_degrade_venue_health() -> None:
+    from darwin.execution.engine import is_business_reject
+
+    for r in ("EC_PostOnlyWillTakeLiquidity", "bybit:110007:insufficient balance", "bybit:10001:params"):
+        assert is_business_reject(r), r
+    for r in ("chaos_reject", "bybit:10003:invalid api key", "bybit:10006:rate limit", "timeout"):
+        assert not is_business_reject(r), r
+
+
+def test_position_mismatch_needs_two_snapshots_and_ignores_fresh_fills() -> None:
+    from darwin.core.events import PositionSnapshot
+    from darwin.core.types import Side
+    from darwin.runtime.engine import CHALLENGE, CHALLENGE_VENUE
+
+    h = build_replay(make_config(), iter([]), T0)
+    eng = h.engine
+    eng.ledger[CHALLENGE].pos("A0001", "BTCUSDT").apply_fill(Side.BUY, 0.01, 100.0)
+    eng.now = T0 + 10_000
+    eng._last_fill_ts[(CHALLENGE, "BTCUSDT")] = T0 + 8_000  # a fill 2s ago: snapshot may predate it
+    snap = PositionSnapshot(ts=eng.now, account=CHALLENGE, symbol="BTCUSDT", qty=0.0)
+    eng.handle(snap)
+    assert eng.health[CHALLENGE_VENUE].reconcile_ok
+    eng.now = T0 + 60_000
+    eng.handle(snap.model_copy(update={"ts": eng.now}))
+    assert eng.health[CHALLENGE_VENUE].reconcile_ok  # first real mismatch: not yet
+    eng.now = T0 + 120_000
+    eng.handle(snap.model_copy(update={"ts": eng.now}))
+    assert not eng.health[CHALLENGE_VENUE].reconcile_ok  # persisted: now it blocks new risk
+    eng.handle(snap.model_copy(update={"ts": eng.now + 60_000, "qty": 0.01}))
+    assert eng.health[CHALLENGE_VENUE].reconcile_ok
+
+
+def test_registry_refuses_records_without_a_passing_report(tmp_path: Any) -> None:
+    import json
+
+    from darwin.research.sandbox import SpeciesRegistry
+    from tests.test_research import GOOD
+
+    reg = SpeciesRegistry(tmp_path)
+    tampered = {
+        "proposal_id": "P1",
+        "primitive": "evo_tampered",
+        "source": GOOD,
+        "report": {"passed": True, "stages": [{"stage": "static", "passed": False}]},
+    }
+    (tmp_path / "P1.json").write_text(json.dumps(tampered))
+    assert reg.load(register=True) == [] and "evo_tampered" not in PRIMITIVES
+
+
+def test_grok_model_picker_skips_non_text_models_and_parses_versions() -> None:
+    from darwin.intelligence.providers.grok import pick_grok_model
+
+    ids = ["grok-3", "grok-4-0709", "grok-code-fast-1", "grok-2-vision-1212", "grok-4.1", "grok-4.1-fast"]
+    assert pick_grok_model(ids) == "grok-4.1"
+    assert pick_grok_model(["grok-3-mini", "grok-3"]) == "grok-3"
+    assert pick_grok_model(["grok-2-image-1212", "gpt-x"]) is None
+
+
+def test_cohort_median_includes_agents_that_died_inside_the_window() -> None:
+    from tests.test_population import feed, make_pop
+
+    pop = make_pop(immigrant_rate=0.0)
+    pop.seed(0)
+    ids = [a.agent_id for a in pop.alive]
+    ts = feed(pop, 0, 100, {ids[0]: 0.0004}, seed=1)
+    base = pop.evaluate(ts)[ids[0]].cohort_median
+    for aid in ids[1:5]:  # four losers die mid-window
+        a = pop.agents[aid]
+        a.status, a.died_ts = type(a.status).DEAD, ts
+        pop.books[aid].equity[-1] *= 0.5
+    ts2 = feed(pop, ts, 20, {ids[0]: 0.0004}, seed=2)
+    after = pop.evaluate(ts2)[ids[0]]
+    assert after.cohort_median < base  # the departed losers still count: no survivorship bias
+    assert pop.prune_books(ts2) == []  # died inside the window: evidence kept
+    far = ts2 + 10 * pop.cfg.eval_generations * pop.cfg.generation_bars * pop.bar_ms
+    assert set(pop.prune_books(far)) == set(ids[1:5]) and pop.trade_count(ids[1]) > 0
+
+
+def test_default_synthetic_stream_uses_deltas_with_gaps() -> None:
+    from darwin.core.events import BookDelta
+    from darwin.runtime.app import synthetic_stream
+
+    cfg = make_config(challenge={"duration_hours": 2}, sim={"synthetic_step_ms": 1_000})
+    evs = list(synthetic_stream(cfg, T0))
+    deltas = [e for e in evs if isinstance(e, BookDelta)]
+    assert len(deltas) > 100
+    h = build_replay(cfg, iter(evs), T0)
+    h.driver.run()
+    assert h.engine.stats["book_invalid"] > 0 and h.engine.stats["orders"] > 0  # gaps detected, recovered

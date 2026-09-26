@@ -79,6 +79,11 @@ class SimSettings(_Frozen):
     #: synthetic market generator
     synthetic_step_ms: int = Field(default=1_000, ge=10)
     synthetic_book_every: int = Field(default=5, ge=1)
+    #: emit incremental book deltas (like Bybit) with occasional sequence gaps, so the default
+    #: sim exercises gap detection and recovery on the next snapshot
+    synthetic_book_deltas: bool = True
+    synthetic_snapshot_every: int = Field(default=50, ge=1)
+    synthetic_gap_prob: float = Field(default=0.001, ge=0, lt=1)
     #: wall-clock acceleration for Mode.SIM
     speed: float = Field(default=60.0, gt=0)
 

@@ -21,6 +21,7 @@ subprocess additionally protects the research run itself.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import resource
 import subprocess
@@ -47,6 +48,8 @@ SECRET_MARKERS = (
     "XAI",
     "TYPESAFE",
 )
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -223,6 +226,11 @@ class SpeciesRegistry:
         for path in sorted(self.dir.glob("P*.json")):
             rec = json.loads(path.read_text())
             name = rec["primitive"]
+            report = rec.get("report") or {}
+            stages = report.get("stages") or []
+            if not report.get("passed") or not stages or not all(st.get("passed") for st in stages):
+                log.warning("registry: %s has no passing sandbox report; not loaded", path.name)
+                continue
             if register and name not in PRIMITIVES:
                 register_primitive(make_primitive(name, rec["source"], f"sandbox:{rec['proposal_id']}"))
             best = rec["report"].get("best_genome")

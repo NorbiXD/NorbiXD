@@ -39,6 +39,25 @@ SYSTEM_PROMPT = (
 )
 
 
+_NOT_TEXT = ("code", "image", "imagine", "vision", "video", "audio", "embed", "tts", "voice")
+_LITE = ("mini", "fast", "lite")
+_VERSION = re.compile(r"grok-(\d+)(?:[.-](\d{1,2})(?!\d))?")
+
+
+def pick_grok_model(ids: list[str]) -> str | None:
+    """The newest general text model: skip code/image/vision/audio variants, rank by parsed
+    version (``grok-4.1`` > ``grok-4-0709`` > ``grok-3``, date suffixes are not versions), and
+    prefer full models over mini/fast ones of the same version."""
+
+    def key(m: str) -> tuple[tuple[int, int], bool, str]:
+        v = _VERSION.match(m.lower())
+        ver = (int(v.group(1)), int(v.group(2) or 0)) if v else (0, 0)
+        return ver, not any(t in m.lower() for t in _LITE), m
+
+    cands = [m for m in ids if m.lower().startswith("grok") and not any(t in m.lower() for t in _NOT_TEXT)]
+    return max(cands, key=key) if cands else None
+
+
 class GrokProvider:
     name = "grok"
 
@@ -72,10 +91,10 @@ class GrokProvider:
     async def model(self) -> str:
         if self._model:
             return self._model
-        grok = sorted((m for m in await self.list_models() if m.startswith("grok")), reverse=True)
-        if not grok:
-            raise ProviderError("no grok models available")
-        self._model = grok[0]
+        best = pick_grok_model(await self.list_models())
+        if best is None:
+            raise ProviderError("no suitable grok text model available")
+        self._model = best
         return self._model
 
     def build_request(self, req: NarrativeRequest, model: str) -> dict[str, Any]:

@@ -420,7 +420,9 @@ def test_m3_champion_can_be_demoted() -> None:
 
 
 def _preflight_rest(
-    positions: list[dict[str, Any]], margin: str = "REGULAR_MARGIN"
+    positions: list[dict[str, Any]],
+    margin: str = "REGULAR_MARGIN",
+    open_orders: list[dict[str, Any]] | None = None,
 ) -> tuple[BybitRest, list[str]]:
     calls: list[str] = []
 
@@ -433,6 +435,8 @@ def _preflight_rest(
             body["result"] = {"list": positions}
         elif req.url.path == "/v5/account/info":
             body["result"] = {"marginMode": margin}
+        elif req.url.path == "/v5/order/realtime":
+            body["result"] = {"list": open_orders or []}
         elif req.url.path == "/v5/position/switch-mode":
             body = {"retCode": 110025, "retMsg": "Position mode is not modified", "result": {}}
         return httpx.Response(200, json=body)
@@ -450,7 +454,7 @@ async def test_m4_preflight_sets_mode_and_leverage_on_flat_account() -> None:
     )
     assert rep.equity == 5000 and rep.margin_mode == "REGULAR_MARGIN"
     assert "/v5/position/switch-mode" in calls and calls.count("/v5/position/set-leverage") == 2
-    assert rep.leverage == {"BTCUSDT": 5.0, "ETHUSDT": 5.0}
+    assert rep.leverage == {"BTCUSDT": 10.0, "ETHUSDT": 10.0}  # 2 x ceil(max_gross_leverage=5)
 
 
 async def test_m4_preflight_refuses_non_flat_or_isolated_accounts() -> None:
@@ -465,6 +469,9 @@ async def test_m4_preflight_refuses_non_flat_or_isolated_accounts() -> None:
     rest3, _ = _preflight_rest([], margin="ISOLATED_MARGIN")
     rep = await account_preflight(rest3, cfg, inst, strict=False)  # testnet: warning only
     assert rep.warnings
+    rest4, _ = _preflight_rest([], open_orders=[{"symbol": "BTCUSDT", "orderLinkId": "manual-1"}])
+    with pytest.raises(PreflightError, match="open orders"):  # could fill into an unknown position
+        await account_preflight(rest4, cfg, inst, strict=False)
 
 
 def test_m4_wallet_pnl_drift_blocks_new_risk_until_reconciled() -> None:

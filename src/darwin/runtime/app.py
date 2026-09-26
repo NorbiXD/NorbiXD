@@ -19,6 +19,8 @@ from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
+import httpx
+
 from darwin.agents.genome import Genome
 from darwin.config.challenge import ChallengeConfig
 from darwin.core.events import Event
@@ -28,7 +30,7 @@ from darwin.exchange.bybit.gateway import BybitExecutionGateway
 from darwin.exchange.bybit.preflight import PreflightReport, account_preflight
 from darwin.exchange.bybit.rest import BybitRest
 from darwin.exchange.bybit.signing import Credentials
-from darwin.exchange.bybit.ws import MAINNET, TESTNET
+from darwin.exchange.bybit.ws import MAINNET, TESTNET, BybitEndpoints
 from darwin.exchange.sim.venue import SimExchange
 from darwin.intelligence.factory import build_intelligence
 from darwin.market.synthetic import SyntheticMarket
@@ -83,6 +85,9 @@ def synthetic_stream(cfg: ChallengeConfig, start_ts: int, planted: bool = True) 
         step_ms=cfg.sim.synthetic_step_ms,
         book_every=cfg.sim.synthetic_book_every,
         planted_edges=planted,
+        book_deltas=cfg.sim.synthetic_book_deltas,
+        snapshot_every=cfg.sim.synthetic_snapshot_every,
+        gap_prob=cfg.sim.synthetic_gap_prob,
     )
     return m.events()
 
@@ -131,7 +136,13 @@ def build_runtime(
     events: Iterable[Event] | None = None,
     start_ts: int | None = None,
     seed_genomes: list[tuple[Genome, str]] | None = None,
+    *,
+    endpoints: BybitEndpoints | None = None,
+    rest_transport: httpx.AsyncBaseTransport | None = None,
+    clock: Clock | None = None,
 ) -> Runtime:
+    """Wire a runtime for ``cfg.challenge.mode``. The keyword-only arguments exist for tests:
+    point the Bybit modes at local fake endpoints, a fake REST transport and an accelerated clock."""
     mode = cfg.challenge.mode
     assert_live_allowed(cfg, mode)
 
@@ -182,10 +193,10 @@ def build_runtime(
         )
 
     # ---- modes backed by Bybit streams
-    endpoints = TESTNET if mode is Mode.TESTNET else MAINNET
-    t0 = start_ts if start_ts is not None else int(time.time() * 1000)
+    endpoints = endpoints or (TESTNET if mode is Mode.TESTNET else MAINNET)
+    clock = clock or Clock()
+    t0 = start_ts if start_ts is not None else clock.now_ms()
     engine = DarwinEngine(cfg, run_id=run_id, start_ts=t0, store=store)
-    clock = Clock()
     driver = LiveDriver(engine, [], clock)
     market_feed = BybitMarketFeed(
         driver, cfg.challenge.symbols, endpoints.public_linear_ws, depth=cfg.exchange.orderbook_depth
@@ -201,7 +212,13 @@ def build_runtime(
         creds = Credentials.from_env(prefix)
         if creds is None:
             raise RuntimeError(f"{mode.value} mode requires {prefix}_API_KEY and {prefix}_API_SECRET")
-        rest = BybitRest(endpoints.rest, creds, recv_window_ms=cfg.exchange.recv_window_ms)
+        rest = BybitRest(
+            endpoints.rest,
+            creds,
+            recv_window_ms=cfg.exchange.recv_window_ms,
+            transport=rest_transport,
+            clock_ms=clock.now_ms,
+        )
         cleanup.append(rest.close)
         instruments = {s: cfg.instrument(s) for s in cfg.challenge.symbols}
         gateway = BybitExecutionGateway(

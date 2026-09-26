@@ -186,7 +186,7 @@ class LiveDriver:
         finally:
             self.stop.set()
             if self.recorder is not None:
-                self.recorder.flush()
+                self.recorder.close()
             flusher.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await flusher

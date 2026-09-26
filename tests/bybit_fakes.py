@@ -1,13 +1,16 @@
-"""Fakes for Bybit: a local WebSocket server speaking the V5 protocol, and message builders."""
+"""Fakes for Bybit: a local WebSocket server speaking the V5 protocol, message builders, and a
+stateful fake exchange (REST handler + private-stream pushes) for end-to-end testnet-mode tests."""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 import json
 from collections.abc import Callable, Iterable
 from typing import Any
 
+import httpx
 from websockets.asyncio.server import Server, ServerConnection, serve
 
 from darwin.core.events import (
@@ -93,6 +96,7 @@ class FakeBybitServer:
         require_auth: str | None = None,
         silent_after_subscribe: bool = False,
         pace: Callable[[dict[str, Any]], float] | None = None,
+        live: asyncio.Queue[dict[str, Any]] | None = None,
     ) -> None:
         self.script = script
         self.close_after = close_after or {}
@@ -100,6 +104,7 @@ class FakeBybitServer:
         self.require_auth = require_auth
         self.silent = silent_after_subscribe
         self.pace = pace
+        self.live = live  # pushed after the script: private-stream messages created on the fly
         self.connections = 0
         self.received: list[dict[str, Any]] = []
         self.server: Server | None = None
@@ -160,8 +165,148 @@ class FakeBybitServer:
                 if self.close_after.get(idx) == n:
                     await ws.close()
                     return
+            if self.live is not None:
+                closed = asyncio.ensure_future(ws.wait_closed())
+                while not closed.done():
+                    get = asyncio.ensure_future(self.live.get())
+                    done, _ = await asyncio.wait({get, closed}, return_when=asyncio.FIRST_COMPLETED)
+                    if get in done:
+                        await ws.send(json.dumps(get.result()))
+                    else:
+                        get.cancel()
             await ws.wait_closed()
         except Exception:
             return
         finally:
             rtask.cancel()
+
+
+class FakeBybitExchange:
+    """Stateful V5 fake: a REST handler (for ``httpx.MockTransport``) whose order creation fills
+    marketable orders at their limit price and pushes ``order`` / ``execution`` / ``position``
+    messages onto the private stream, like the real venue (ACK over REST, fills over WS)."""
+
+    FEE = 0.00055
+
+    def __init__(self, equity: float = 1_000.0) -> None:
+        self.private: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self.cash = equity
+        self.positions: dict[str, list[float]] = {}  # symbol -> [qty, avg]
+        self.orders: dict[str, dict[str, Any]] = {}
+        self.execs: dict[str, list[dict[str, Any]]] = {}
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.mark: Callable[[str], float | None] = lambda _s: None
+        self._ids = itertools.count(1)
+
+    # ---- accounting
+    def _apply(self, symbol: str, side: str, qty: float, px: float) -> None:
+        sgn = 1.0 if side == "Buy" else -1.0
+        pos = self.positions.setdefault(symbol, [0.0, 0.0])
+        q, avg = pos
+        dq = sgn * qty
+        if q == 0 or (q > 0) == (dq > 0):
+            pos[1] = (abs(q) * avg + qty * px) / (abs(q) + qty)
+        else:
+            closed = min(abs(q), qty)
+            self.cash += closed * (px - avg) * (1 if q > 0 else -1)
+            if qty > abs(q):
+                pos[1] = px
+        pos[0] = round(q + dq, 10)
+        if pos[0] == 0:
+            pos[1] = 0.0
+        self.cash -= qty * px * self.FEE
+
+    def equity(self) -> float:
+        eq = self.cash
+        for sym, (q, avg) in self.positions.items():
+            m = self.mark(sym) or avg
+            eq += q * (m - avg)
+        return eq
+
+    # ---- REST
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        params = dict(request.url.params)
+        body = json.loads(request.content) if request.content else {}
+        args = {**params, **body}
+        self.calls.append((path, args))
+        ok: dict[str, Any] = {"retCode": 0, "retMsg": "OK", "result": {}}
+        if path == "/v5/account/wallet-balance":
+            eq = f"{self.equity():.6f}"
+            ok["result"] = {"list": [{"totalEquity": eq, "totalWalletBalance": f"{self.cash:.6f}"}]}
+        elif path == "/v5/account/info":
+            ok["result"] = {"marginMode": "REGULAR_MARGIN"}
+        elif path in ("/v5/position/switch-mode", "/v5/position/set-leverage"):
+            pass
+        elif path == "/v5/position/list":
+            ok["result"] = {"list": [self._position_row(s) for s in self.positions]}
+        elif path == "/v5/order/create":
+            ok["result"] = self._create(args)
+        elif path == "/v5/order/cancel":
+            o = self.orders.get(args["orderLinkId"])
+            if o is None or o["orderStatus"] != "New":
+                return httpx.Response(
+                    200, json={"retCode": 110001, "retMsg": "order not exists", "result": {}}
+                )
+            o["orderStatus"] = "Cancelled"
+            self.private.put_nowait({"topic": "order", "data": [dict(o)]})
+            ok["result"] = {"orderId": o["orderId"], "orderLinkId": o["orderLinkId"]}
+        elif path == "/v5/order/realtime":
+            link = args.get("orderLinkId")
+            rows = [o for o in self.orders.values() if o["orderStatus"] == "New"]
+            ok["result"] = {"list": [o for o in rows if link is None or o["orderLinkId"] == link]}
+        elif path == "/v5/order/history":
+            o = self.orders.get(args.get("orderLinkId", ""))
+            ok["result"] = {"list": [o] if o else []}
+        elif path == "/v5/execution/list":
+            ok["result"] = {"list": self.execs.get(args.get("orderLinkId", ""), [])}
+        else:
+            return httpx.Response(404)
+        return httpx.Response(200, json=ok)
+
+    def _position_row(self, symbol: str) -> dict[str, Any]:
+        q, avg = self.positions[symbol]
+        side = "Buy" if q > 0 else "Sell" if q < 0 else ""
+        return {"symbol": symbol, "side": side, "size": f"{abs(q):.10g}", "entryPrice": f"{avg:.10g}"}
+
+    def _create(self, a: dict[str, Any]) -> dict[str, Any]:
+        oid = f"X{next(self._ids)}"
+        qty, px = float(a["qty"]), float(a["price"])
+        o = {
+            "category": "linear",
+            "symbol": a["symbol"],
+            "orderId": oid,
+            "orderLinkId": a["orderLinkId"],
+            "side": a["side"],
+            "orderStatus": "New",
+            "cumExecQty": "0",
+            "avgPrice": "0",
+            "rejectReason": "EC_NoError",
+            "updatedTime": "0",
+        }
+        self.orders[a["orderLinkId"]] = o
+        if a.get("timeInForce") == "PostOnly":
+            self.private.put_nowait({"topic": "order", "data": [dict(o)]})  # rests until cancelled
+            return {"orderId": oid, "orderLinkId": a["orderLinkId"]}
+        self._apply(a["symbol"], a["side"], qty, px)
+        o.update(orderStatus="Filled", cumExecQty=a["qty"], avgPrice=a["price"])
+        ex = {
+            "category": "linear",
+            "symbol": a["symbol"],
+            "execFee": f"{qty * px * self.FEE:.8f}",
+            "execId": f"E{oid}",
+            "execPrice": a["price"],
+            "execQty": a["qty"],
+            "execType": "Trade",
+            "isMaker": False,
+            "orderId": oid,
+            "orderLinkId": a["orderLinkId"],
+            "side": a["side"],
+            "execTime": "0",
+        }
+        self.execs[a["orderLinkId"]] = [ex]
+        # like the real venue, the order and execution streams are not mutually ordered
+        self.private.put_nowait({"topic": "execution", "data": [ex]})
+        self.private.put_nowait({"topic": "order", "data": [dict(o)]})
+        self.private.put_nowait({"topic": "position", "data": [self._position_row(a["symbol"])]})
+        return {"orderId": oid, "orderLinkId": a["orderLinkId"]}

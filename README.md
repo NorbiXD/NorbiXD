@@ -62,15 +62,21 @@ docker compose up --build
   `BYBIT_API_KEY/SECRET`.
 * Risk limits live in `challenge.yaml`, are frozen at start-up, are fingerprinted into every run
   record, and are not reachable from agents, evolution or LLM providers.
-* `touch KILL` (or `POST /api/kill-switch` with `DARWIN_OPERATOR_TOKEN`) halts new risk and
-  flattens the challenge account. Getting flat is never blocked by the safety system.
+* `touch KILL` (or `POST /api/kill-switch` with `DARWIN_OPERATOR_TOKEN`) halts new risk,
+  cancels working entries and flattens the challenge account, **retrying every heartbeat until
+  it is actually flat** (venue rejects, partial fills and lost orders are retried; tested by
+  failure injection). Breakers and the end of the challenge flatten the same way. Getting flat is
+  never blocked by the safety system.
+* Machine-generated species run in-process only after passing a static allowlist DSL and a
+  credential-free sandbox; a species that raises is quarantined, not the trading loop.
 * Tests never need credentials or network.
 
 ## Development
 
 ```bash
-.venv/bin/pytest            # ~220 tests: look-ahead perturbation, e2e evolution, known-answer science,
-                            # chaos, governor property tests (-m "not slow" skips the long ones)
+.venv/bin/pytest            # 245 tests: look-ahead perturbation, e2e evolution, multi-seed known-answer
+                            # science, chaos + flatten failure injection, testnet wiring against a fake
+                            # Bybit, governor property tests (-m "not slow" skips the ~3 min ones)
 .venv/bin/ruff check src tests && .venv/bin/ruff format --check src tests
 .venv/bin/mypy              # strict
 ```

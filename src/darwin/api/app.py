@@ -89,7 +89,7 @@ def create_app(engine: DarwinEngine, webhooks: dict[str, WebhookSignalFeed] | No
         if a is None:
             raise HTTPException(404, "unknown agent")
         e = engine.population.last_evaluations.get(agent_id)
-        book = engine.population.books[agent_id]
+        book = engine.population.books.get(agent_id)
         sacct = engine.ledger.accounts.get(shadow_account(agent_id))
         return {
             "agent_id": agent_id,
@@ -101,9 +101,9 @@ def create_app(engine: DarwinEngine, webhooks: dict[str, WebhookSignalFeed] | No
             "genome_id": a.genome.genome_id,
             "genome": a.genome.model_dump(mode="json"),
             "evaluation": e.to_record() if e else None,
-            "shadow_equity_curve": list(zip(book.ts[-500:], book.equity[-500:], strict=True)),
+            "shadow_equity_curve": list(zip(book.ts[-500:], book.equity[-500:], strict=True)) if book else [],
             "shadow_equity": sacct.last_equity if sacct else None,
-            "trades": len(book.trades),
+            "trades": engine.population.trade_count(agent_id),
             "lineage": [r for r in engine.recent_lineage if r["agent_id"] == agent_id],
         }
 
@@ -151,7 +151,6 @@ def create_app(engine: DarwinEngine, webhooks: dict[str, WebhookSignalFeed] | No
     def trades(limit: int = Query(100, le=1_000), account: str = "challenge") -> Any:
         if store is None:
             return []
-        store.flush()
         rows = store.query("trades", account_id=account) if account else store.query("trades")
         rows.sort(key=lambda r: r["exit_ts"] or 0, reverse=True)
         return _jsonable(rows[:limit])
@@ -160,7 +159,6 @@ def create_app(engine: DarwinEngine, webhooks: dict[str, WebhookSignalFeed] | No
     def get_explain(intent_id: str) -> Any:
         if store is None:
             raise HTTPException(503, "no audit store configured")
-        store.flush()
         ex = explain(store, intent_id, run_id=engine.run_id)
         if ex is None:
             raise HTTPException(404, "unknown intent")
@@ -171,7 +169,6 @@ def create_app(engine: DarwinEngine, webhooks: dict[str, WebhookSignalFeed] | No
         """ "Why did <agent> trade <symbol> at <ts ms>?" -> the explanation of the latest intent."""
         if store is None:
             raise HTTPException(503, "no audit store configured")
-        store.flush()
         iid = find_intent(store, agent, symbol, at, run_id=engine.run_id)
         if iid is None:
             raise HTTPException(404, "no decision found")
@@ -207,14 +204,12 @@ def create_app(engine: DarwinEngine, webhooks: dict[str, WebhookSignalFeed] | No
     def attribution_species() -> Any:
         if store is None:
             return []
-        store.flush()
         return _jsonable(species_regime_performance(store, engine.run_id))
 
     @app.get("/api/attribution/signals")
     def attribution_signals() -> Any:
         if store is None:
             return []
-        store.flush()
         return _jsonable(signal_information(store, engine.run_id))
 
     @app.post("/api/kill-switch")

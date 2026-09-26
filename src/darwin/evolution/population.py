@@ -128,6 +128,7 @@ class Population:
         self.rng = np.random.default_rng(seed + 424_242)
         self.agents: dict[str, Agent] = {}
         self.books: dict[str, AgentBook] = {}
+        self._pruned_trades: dict[str, int] = {}
         self.generation = 0
         self.generation_start_ts = 0
         self.champion_id: str | None = None
@@ -264,6 +265,24 @@ class Population:
         return ts[1:], np.diff(np.log(np.maximum(eq, 1e-9)))
 
     # ------------------------------------------------------------------ evaluation
+    def trade_count(self, agent_id: str) -> int:
+        b = self.books.get(agent_id)
+        return len(b.trades) if b is not None else self._pruned_trades.get(agent_id, 0)
+
+    def prune_books(self, now: int) -> list[str]:
+        """Forget the evidence of agents dead for longer than the evaluation window (they can no
+        longer enter any cohort); keep only their trade count. Returns the pruned agent ids."""
+        horizon = now - self.cfg.eval_generations * self.cfg.generation_bars * self.bar_ms
+        gone = [
+            aid
+            for aid, a in self.agents.items()
+            if not a.alive and a.died_ts is not None and a.died_ts < horizon and aid in self.books
+        ]
+        for aid in gone:
+            self._pruned_trades[aid] = len(self.books[aid].trades)
+            del self.books[aid]
+        return gone
+
     def _window_fitness(self, agent_id: str, start: int, now: int, seed: str) -> FitnessReport:
         b = self.books[agent_id]
         ts = np.asarray(b.ts, dtype=np.int64)
@@ -295,8 +314,16 @@ class Population:
         alive = self.alive
         starts = {a.agent_id: max(since, a.born_ts) for a in alive}
         rets = {a.agent_id: self.returns(a.agent_id, starts[a.agent_id]) for a in alive}
-        # fitness of every agent on every distinct window it fully covers
+        # agents that died inside the window were part of the cohort on the bars they lived:
+        # leaving them out would benchmark everyone against survivors only (survivorship bias)
+        departed = [
+            a
+            for a in self.agents.values()
+            if not a.alive and a.died_ts is not None and a.died_ts > since and a.agent_id in self.books
+        ]
+        # fitness of every agent on every distinct window (the departed: on the part they lived)
         by_window: dict[int, dict[str, FitnessReport]] = {}
+        cohort_fit: dict[int, list[float]] = {}
         for w_start in sorted(set(starts.values())):
             cohort = [a for a in alive if a.born_ts <= w_start]
             by_window[w_start] = {
@@ -305,9 +332,16 @@ class Population:
                 )
                 for a in cohort
             }
-        # cohort median return per bar (paired, window-matched comparison)
+            fits = [r.fitness for r in by_window[w_start].values()]
+            for d in departed:
+                if d.born_ts <= w_start < (d.died_ts or 0):
+                    seed = f"{d.agent_id}:{self.generation}:{w_start}:departed"
+                    fits.append(self._window_fitness(d.agent_id, w_start, d.died_ts or now, seed).fitness)
+            cohort_fit[w_start] = fits
+        # cohort median return per bar (paired, window-matched comparison), departed included
         by_ts: dict[int, list[float]] = {}
-        for ts_arr, r_arr in rets.values():
+        series = list(rets.values()) + [self.returns(d.agent_id, max(since, d.born_ts)) for d in departed]
+        for ts_arr, r_arr in series:
             for t, r in zip(ts_arr.tolist(), r_arr.tolist(), strict=True):
                 by_ts.setdefault(t, []).append(r)
         median = {t: float(np.median(v)) for t, v in by_ts.items()}
@@ -316,7 +350,7 @@ class Population:
         for a in alive:
             w = by_window[starts[a.agent_id]]
             rep = w[a.agent_id]
-            cohort_med = float(np.median([r.fitness for r in w.values()]))
+            cohort_med = float(np.median(cohort_fit[starts[a.agent_id]]))
             ts_arr, r_arr = rets[a.agent_id]
             med = np.array([median[t] for t in ts_arr.tolist()], dtype=float)
             excess_t = paired_t_stat(r_arr, med) if r_arr.size else 0.0

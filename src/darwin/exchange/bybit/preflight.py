@@ -3,11 +3,13 @@
 Checks (live: every failure is fatal; testnet: soft failures are reported as warnings):
 
 1. wallet equity covers the challenge's starting capital (the ledger trades that capital only);
-2. the account is **flat** on every challenge symbol — there is no crash-resume, so adopting
-   unknown positions would break attribution and reconciliation;
+2. the account is **flat** on every challenge symbol and has **no open orders** there — there
+   is no crash-resume, so adopting unknown positions (or orders that could fill into them)
+   would break attribution and reconciliation;
 3. margin mode is cross (``REGULAR_MARGIN``): the governor's liquidation model assumes it;
 4. position mode is one-way (the engine sends ``positionIdx=0`` and nets agents);
-5. per-symbol leverage is set so the exchange's initial margin never binds before our own limits.
+5. per-symbol leverage is set to twice the gross-leverage limit (capped by the instrument), so
+   the exchange's initial margin never binds before our own limits, even after losses.
 """
 
 from __future__ import annotations
@@ -56,6 +58,13 @@ async def account_preflight(
     ]
     if open_pos:
         problem(f"account is not flat on challenge symbols: {open_pos}", hard=True)
+    working = [
+        f"{o['symbol']}:{o.get('orderLinkId') or o.get('orderId')}"
+        for o in await rest.open_orders()
+        if o.get("symbol") in symbols
+    ]
+    if working:
+        problem(f"account has open orders on challenge symbols: {working}", hard=True)
 
     info = await rest.account_info()
     rep.margin_mode = str(info.get("marginMode", ""))
@@ -63,7 +72,7 @@ async def account_preflight(
         problem(f"margin mode {rep.margin_mode} != REGULAR_MARGIN (cross); liquidation model assumes cross")
 
     await rest.set_one_way_mode("USDT")
-    target = max(1.0, math.ceil(cfg.risk.max_gross_leverage))
+    target = max(1.0, 2 * math.ceil(cfg.risk.max_gross_leverage))
     for sym in sorted(symbols):
         lev = min(instruments[sym].max_leverage, target)
         await rest.set_leverage(sym, lev)

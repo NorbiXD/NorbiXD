@@ -155,6 +155,11 @@ class BybitRest:
         rows: list[dict[str, Any]] = res.get("list", [])
         return rows
 
+    async def open_orders(self) -> list[dict[str, Any]]:
+        res = await self._request("GET", "/v5/order/realtime", {"category": "linear", "settleCoin": "USDT"})
+        rows: list[dict[str, Any]] = res.get("list", [])
+        return rows
+
     async def positions(self) -> list[dict[str, Any]]:
         res = await self._request("GET", "/v5/position/list", {"category": "linear", "settleCoin": "USDT"})
         rows: list[dict[str, Any]] = res.get("list", [])

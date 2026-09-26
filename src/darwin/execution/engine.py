@@ -16,6 +16,7 @@ Guarantees
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -30,6 +31,30 @@ from darwin.risk.governor import Reservations, RiskDecision, VenueHealth
 log = logging.getLogger(__name__)
 
 FillCallback = Callable[[ManagedOrder, FillEvent, list[RoundTrip]], None]
+
+_BUSINESS_REJECTS = frozenset(
+    {
+        "post_only_would_cross",
+        "duplicate_client_order_id",
+        "reduce_only_would_increase",
+        "order_not_found",
+        "book_unavailable",
+    }
+)
+# Bybit retCodes that are business outcomes of a healthy API (balance, price band, min size,
+# reduce-only, order-count limits, bad params), unlike auth/permission/transport failures
+_BYBIT_BUSINESS = re.compile(r"^bybit:(10001|110\d{3}):")
+
+
+def is_business_reject(reason: str) -> bool:
+    """A reject that says "the venue is working and said no" — it must not degrade venue
+    health (which halts all new risk), unlike lost requests or auth failures."""
+    return (
+        reason in _BUSINESS_REJECTS
+        or reason.startswith("cancel_rejected")
+        or reason.startswith("EC_")  # Bybit stream rejectReason codes
+        or _BYBIT_BUSINESS.match(reason) is not None
+    )
 
 
 @dataclass
@@ -240,14 +265,7 @@ class ExecutionEngine:
             mo.exchange_order_id = ev.exchange_order_id
         mo.reported_cum_qty = max(mo.reported_cum_qty, ev.cum_qty)
         if ev.status is OrderStatus.REJECTED:
-            api_failure = ev.reason not in {
-                "post_only_would_cross",
-                "duplicate_client_order_id",
-                "reduce_only_would_increase",
-                "order_not_found",
-                "book_unavailable",
-            } and not ev.reason.startswith("cancel_rejected")
-            if api_failure:
+            if not is_business_reject(ev.reason):
                 self.health[venue].consecutive_errors += 1
         elif ev.status in (OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED):
             self.health[venue].consecutive_errors = 0

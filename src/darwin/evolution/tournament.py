@@ -9,6 +9,10 @@ The holdout replay starts ``warmup`` before the holdout window so indicators are
 bars/trades inside the holdout window count. Train and holdout never overlap in time, and the
 holdout agents are frozen (no evolution) — so the holdout numbers are genuinely out-of-sample
 for the selection step. A large train→holdout degradation is reported as overfitting.
+
+``baseline_k`` random genomes (no selection at all) are evaluated alongside the champions on the
+*same* holdout bars. Selection has found an edge only if champions beat that baseline; beating
+zero is not enough when the whole market drifted (tests/test_evolution_science.py).
 """
 
 from __future__ import annotations
@@ -16,13 +20,13 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-from darwin.agents.genome import Genome
+from darwin.agents.genome import Genome, random_genome
 from darwin.config.challenge import ChallengeConfig
 from darwin.core.events import Event
 from darwin.evolution.fitness import FitnessReport, compute_fitness
@@ -47,6 +51,17 @@ class TournamentResult:
     holdout_window: tuple[int, int]
     config_fingerprint: str
     elapsed_s: float
+    #: random, unselected genomes evaluated on the same holdout bars (the null of selection)
+    baselines: list[ChampionRecord] = field(default_factory=list)
+
+    def excess_over_baseline(self, metric: str = "net_return") -> float:
+        """Mean holdout ``metric`` of champions minus that of the random baseline."""
+        if not self.champions or not self.baselines:
+            return 0.0
+        return float(
+            np.mean([c.holdout[metric] for c in self.champions])
+            - np.mean([b.holdout[metric] for b in self.baselines])
+        )
 
     def degradation(self) -> float:
         """Mean(train fitness) - mean(holdout fitness) of the selected genomes."""
@@ -82,6 +97,8 @@ def run_tournament(
     population_size: int = 48,
     generation_bars: int = 120,
     warmup_ms: int = 6 * 3_600_000,
+    baseline_k: int = 0,
+    baseline_seed: int = 0,
 ) -> TournamentResult:
     t_start = time.time()
     train_end = start_ts + train_ms
@@ -121,7 +138,16 @@ def run_tournament(
             time.time() - t_start,
         )
 
-    # ---- holdout: frozen re-evaluation on unseen, later data
+    # ---- holdout: frozen re-evaluation on unseen, later data (plus the random baseline)
+    brng = np.random.default_rng(baseline_seed)
+    chosen = {g.genome_id for g, _ in selected}
+    baselines: list[tuple[Genome, str]] = []
+    while len(baselines) < baseline_k:
+        g = random_genome(brng, tuple(cfg.challenge.symbols), max_terms=cfg.evolution.max_terms)
+        if g.genome_id not in chosen:
+            chosen.add(g.genome_id)
+            baselines.append((g, "baseline:random"))
+    baseline_ids = {g.genome_id for g, _ in baselines}
     hold_start = train_end - warmup_ms
     total_bars = (holdout_end - hold_start) // bar_ms
     hold_cfg = cfg.model_copy(
@@ -130,7 +156,10 @@ def run_tournament(
                 update={"duration_hours": (holdout_end - hold_start) / 3_600_000}
             ),
             "evolution": cfg.evolution.model_copy(
-                update={"population_size": max(4, len(selected)), "generation_bars": int(total_bars) + 10}
+                update={
+                    "population_size": max(4, len(selected) + len(baselines)),
+                    "generation_bars": int(total_bars) + 10,
+                }
             ),
         }
     )
@@ -139,12 +168,13 @@ def run_tournament(
         (e for e in events if hold_start <= e.ts < holdout_end),
         hold_start,
         run_id="tournament-holdout",
-        seed_genomes=selected,
+        seed_genomes=selected + baselines,
         fill=False,
     )
     hold.driver.run()
     hpop = hold.engine.population
     champions: list[ChampionRecord] = []
+    base_records: list[ChampionRecord] = []
     for agent in hpop.agents.values():
         book = hpop.books[agent.agent_id]
         ts = np.asarray(book.ts, dtype=np.int64)
@@ -160,15 +190,14 @@ def run_tournament(
             seed_key=f"holdout:{agent.agent_id}",
         )
         g = agent.genome
-        champions.append(
-            ChampionRecord(
-                genome_id=g.genome_id,
-                species=g.species,
-                genome=g.model_dump(mode="json"),
-                train=train_metrics.get(g.genome_id, {}),
-                holdout=_summary(rep),
-            )
+        rec = ChampionRecord(
+            genome_id=g.genome_id,
+            species=g.species,
+            genome=g.model_dump(mode="json"),
+            train=train_metrics.get(g.genome_id, {}),
+            holdout=_summary(rep),
         )
+        (base_records if g.genome_id in baseline_ids else champions).append(rec)
     champions.sort(key=lambda c: -c.holdout["fitness"])
     return TournamentResult(
         champions=champions,
@@ -178,6 +207,7 @@ def run_tournament(
         holdout_window=(train_end, holdout_end),
         config_fingerprint=cfg.fingerprint(),
         elapsed_s=time.time() - t_start,
+        baselines=base_records,
     )
 
 

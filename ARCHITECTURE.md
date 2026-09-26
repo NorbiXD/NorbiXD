@@ -98,7 +98,10 @@ targeted resubscribe), `feeds.py`, `rest.py`, `gateway.py`, `signing.py`.
   quantity than we have fills for: Bybit's `order` and `execution` streams are not mutually
   ordered, so `Filled` can arrive before the executions. Missing executions are queried and, if
   they never come, position reconciliation arbitrates.
-* "Market" orders are marketable IOC limits with an explicit slippage cap. Exits widen the cap.
+* "Market" orders are marketable IOC limits with an explicit slippage cap. Exits widen the cap
+  (≥2%) and anchor it on the *worse* of the reference price and the executable touch, so a book
+  that gapped away from a lagging mark cannot leave a stop unfillable (found by
+  `test_stop_loss_exit_goes_through_while_an_increasing_order_is_working`).
 * No ACK within `order_ack_timeout_ms` ⇒ query by `orderLinkId` (open → history → not found),
   replaying executions. Three silent queries ⇒ `UNKNOWN`, venue health degraded, new risk blocked
   until the venue answers definitively.
@@ -106,8 +109,11 @@ targeted resubscribe), `feeds.py`, `rest.py`, `gateway.py`, `signing.py`.
   REJECTED; ambiguous failures (timeouts, 5xx, rate limits) emit nothing and are reconciled;
   `orderLinkId is duplicate` ⇒ the earlier attempt landed ⇒ reconcile. Private-stream reconnect
   ⇒ re-query all open orders + positions.
-* Periodic position snapshots reconcile the challenge account; a mismatch (with no orders in
-  flight) blocks new risk.
+* Periodic position snapshots reconcile the challenge account. A mismatch blocks new risk only if
+  it persists over two consecutive snapshots with no order in flight and no fill in the last 5s
+  (a snapshot can predate a fill). Venue *business* rejects (Bybit `EC_*` stream reasons and
+  `110xxx` retCodes: balance, price band, min size, reduce-only) do not degrade venue health;
+  lost requests, auth and transport failures do.
 
 ## 6. Risk Governor (not evolvable)
 
@@ -130,6 +136,23 @@ per-agent leverage · per-symbol and gross exposure (gross of agent sub-position
 instrument leverage · lot/min-notional rounding · post-trade liquidation re-check. A rejected
 flip is downgraded to a close. Martingale is structurally impossible: size is a function of
 current equity and allocation only; agents cannot request more after losses.
+
+**Flatten until flat.** A kill switch, a tripped breaker (`flatten_on_breaker`) or the end of the
+challenge is a *condition*, not a one-shot action. On every heartbeat and bar close while it
+holds, the engine cancels working risk-increasing orders and re-issues exits for every open
+sub-position, until ledger, venue positions and working orders are all clear
+(`flatten_complete`). A system exit is never blocked by a working entry (the entry is cancelled
+and the filled quantity exited; a late fill is exited on the next pass); only an in-flight exit
+blocks another one, because an exit that is `UNKNOWN` may already have executed and a duplicate
+would flip the position. Retries per sub-position are rate-bounded. Drivers keep draining after
+the end until everything is flat (bounded; otherwise `flatten_incomplete`). Pinned by
+failure-injection tests: a minute of venue rejects during a kill, partial exit fills, lost exit
+orders that go `UNKNOWN`, a breaker trip under rejects, challenge end under chaos, a resting
+entry at kill time, and a stop racing a working entry (`tests/test_flatten.py`).
+
+The challenge book also re-syncs to the shadow books every bar: if an exit filled in an agent's
+shadow book but not in the challenge book (a reject, a stop hit at a different entry, a lost
+fill), the leftover is closed (`desync_exit`); leftovers of dead or defunded agents too.
 
 ## 7. Agents: a strategy DSL
 
@@ -169,15 +192,18 @@ Test `test_lucky_suicidal_bet_ranks_below_steady_edge` pins the core property.
   require positive *absolute* fitness (beating a losing crowd is not an edge). The evaluation
   window must span regimes (6 generations × 240 bars = 24h by default): with a 6h window
   evolution killed trend followers during range regimes and never found the planted trend edge;
-  with 24h it does (§15).
+  with 24h it can, though convergence on trend species is seed-dependent (§15).
 * Eligibility: `min_trades` and `min_age_generations`. Nobody dies before that — except by
   **ruin** (shadow equity < `ruin_fraction`).
 * Persistent inferiority = bottom `kill_fraction` by window-matched relative fitness **and**
   paired t-stat of bar returns vs. the cohort median on identical bars `< -kill_t_stat` ⇒
   strike + probation (no capital, still evaluated). `max_strikes` ⇒ death. Recovery removes
   strikes. The champion is not immune. Inactive agents die after `max_inactive_generations`.
-* Diversity: fitness sharing penalises correlation with better-ranked agents; species share cap;
-  immigrants favour under-represented primitives; offspring deduped by genome hash/distance.
+* Diversity: fitness sharing penalises correlation with better-ranked agents
+  (`correlation_penalty` 1.0); species share cap; at most `max_offspring_per_parent` children per
+  parent per generation; immigrants favour under-represented primitives; offspring deduped by
+  genome hash/distance. The cohort median includes agents that died inside the window, on the
+  bars they lived (no survivorship bias in the benchmark).
 * Reproduction: tournament selection among qualified agents; crossover then light mutation, or
   mutation. Immigrants take a fraction of the free slots (never all of them when parents
   qualify); if nobody qualifies, only immigrants are born (losers don't breed). Every mutation
@@ -194,13 +220,25 @@ weights). Weights rebalance every `rebalance_bars` and at every generation; defu
 agents are flattened; newly funded agents are synced to their current shadow exposure. Whether
 Thompson beats fitness-weighting must be shown by benchmark, not asserted (see progress.md).
 
+**De-cloning.** All three policies walk candidates best-first and give no capital to one whose
+bar returns correlate above `max_pair_correlation` (0.7) with an agent already funded; the
+exploration slot obeys the same rule (exploration buys information, not more of the same bet).
+On the 96h default replay this took rebalances in which a >0.7-correlated pair held most of the
+capital from 21/93 to 0/93. Capital can still concentrate in one *lineage family* whose members
+behave differently (mean largest-family share 0.84): that is diversification within a winning
+family, not cloning, and it is reported rather than hidden.
+
 ## 11. Persistence & attribution
 
 SQLAlchemy Core schema portable across SQLite (local/tests) and PostgreSQL (docker compose).
 Every table is keyed by `(run_id, id)`, so many runs share one database; exchange-facing client
 order ids carry a per-run tag so they never collide across runs. Writes are buffered
-(`AuditStore`) and flushed off the hot path; a failed flush puts its batch back and **halts new
-challenge risk** until the store recovers (no trading without an audit trail).
+(`AuditStore`) and flushed off the hot path. Rows are sanitized on the way in (NaN/Inf → NULL,
+numpy scalars, oversized integers). A *transient* failure (connection lost, database locked or
+unreachable) puts the batch back and **halts new challenge risk** until the store recovers (no
+trading without an audit trail); a row the database refuses is isolated by a row-by-row retry
+and written to `dead_letters`, so one bad row can never halt trading forever. A run id that
+already has an audit trail is refused; default run ids carry a random suffix.
 `attribution/analytics.py` learns *where* intelligence works: trade performance by
 (species, regime at entry) and each signal source's forward-return rank IC by regime and
 horizon ("source X is informative only in high volatility"). `attribution/explain.py`
@@ -227,8 +265,10 @@ and the kill switch are evaluated on every heartbeat, not only at bar close.
 Regime-switching (trend/range/high-vol) with planted, cost-aware structure: trend drift,
 range OU reversion, liquidation cascades that overshoot and retrace, and a weak book-imbalance
 drift that should *not* survive taker fees. `planted_edges=False` gives a null market with the
-same microstructure surface and no structure. It validates the machinery; it is not evidence
-about real markets.
+same microstructure surface and no structure. By default it streams Bybit-style book deltas
+with a periodic snapshot and occasional sequence gaps, so every sim run exercises gap detection
+(the book is invalid, bars go stale, no decisions) and recovery on the next snapshot. It
+validates the machinery; it is not evidence about real markets.
 
 ## 14. Multi-speed intelligence
 
@@ -242,7 +282,11 @@ replay: `now + simulated latency`), so agents can only use a model output after 
 existed (the future-perturbation test also runs with intelligence enabled). Failing providers
 are paused (circuit breaker). Signals are persisted with provider, model, payload and latency
 and appear in `explain`. External feeds implement `ExternalSignalFeed`; the webhook feed
-requires an HMAC signature, validates schema and symbols, dedupes ids and rate-limits.
+requires a timestamped HMAC signature (5-minute replay window), bounds the body while streaming,
+rejects NaN/Infinity and implausible `observed_ts`, validates schema and symbols, dedupes ids,
+rate-limits, and forces topic `external` so a webhook cannot impersonate the model or X-narrative
+channels. A failing bar observer (e.g. a provider) is disabled after three errors; trading
+continues.
 Platforms whose terms do not permit this use stay `DisabledFeed`s.
 
 ## 15. Offline evolution, benchmarks and known-answer tests
@@ -251,12 +295,16 @@ Platforms whose terms do not permit this use stay `DisabledFeed`s.
   window-matched fitness, then frozen re-evaluation on a later, unseen holdout window, then a
   champion-set JSON (`darwin run --seed-genomes`). Train→holdout degradation is reported
   (winner's curse / overfitting).
-* Known answers (`tests/test_evolution_science.py`): on the planted market evolution converges on
-  trend-family species (hand-built momentum/breakout genomes earn +26…+47% at 1x over 3 days;
-  mean reversion loses −35…−53%) and the selection keeps a positive mean holdout return. On the
-  null market it produces no out-of-sample edge and train winners degrade (e.g. a contrarian
-  with train fitness 12.3 lost 16% in holdout). Per-champion holdout returns are high-variance on
-  a single 24h path, a real limitation of short evaluation horizons.
+* Known answers (`tests/test_evolution_science.py`), always across seeds and against a baseline
+  of random, unselected genomes evaluated on the same holdout bars: on the planted market
+  selected genomes beat random genomes out of sample (6 seeds, mean +5.5%, seed-level t ≈ 3.0);
+  on the null market selection produces no positive out-of-sample return and train winners
+  degrade. **Not claimed, because the data does not support it:** separation of planted from
+  null in absolute holdout returns (t ≈ 1.1 over 10 vs 6 seeds), or convergence on trend-family
+  species (seed-dependent: some seeds converge on liquidation or mean-reversion hybrids). Part of
+  the edge over random genomes is cost/risk avoidance, which also exists on noise. Hand-built
+  momentum/breakout genomes do earn +26…+47% at 1x over 3 days on the planted market, so the
+  gap is in the search, not the environment (progress.md).
 * `darwin bench-allocators`: equal vs fitness-weighted vs Thompson on identical seeds. Because
   evaluation happens on shadow books, the population and its decisions are *identical* across
   allocators for a given seed, so the comparison is perfectly paired (results in progress.md).
@@ -265,12 +313,17 @@ Platforms whose terms do not permit this use stay `DisabledFeed`s.
 
 `research/`: proposals are DSL source (`dsl.py`), a statically verified Python subset where the
 only reachable attributes are `v.<feature API>` and `math.<fn>` (no imports, loops,
-comprehensions, lambdas, `**`, keywords or dunders), so promoted code is safe to run
-in-process. `sandbox.py` runs every other stage in a subprocess with a scrubbed environment (no
+comprehensions, lambdas, `**`, keywords, dunders, decorators or annotations). Values are bounded
+by construction: no string constants except parameter keys and signal topics, integer constants
+outside feature arguments compile as floats and `int()` is only allowed inside feature
+arguments, so `"a" * 999999999`-style memory bombs cannot be written. Promoted code runs
+in-process, and any exception it raises quarantines that agent only (killed with lineage
+`runtime_error`, positions flattened); the bar loop continues. `sandbox.py` runs every other stage in a subprocess with a scrubbed environment (no
 credentials), CPU/memory rlimits, `RLIMIT_FSIZE=0`, no database and a timeout: unit tests on
 real FeatureViews (bounded, deterministic, stateless, not dead code, fast), a leakage check,
 train replay with fees and slippage, holdout, and a challenger comparison against the champion
-on identical bars. Passing species are saved to a registry, re-validated on load, registered as
+on identical bars. Passing species are saved to a registry, re-validated on load (source and a
+fully passing report), registered as
 primitives (origin `sandbox:<id>`) and injected into the live population as challengers (lineage
 `proposed`). `TemplateProposer` is an offline proposer; `LLMProposer` wraps any frontier model.
 The Risk Governor and execution engine sit outside all of this and are not evolvable.
