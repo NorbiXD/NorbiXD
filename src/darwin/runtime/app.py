@@ -33,6 +33,7 @@ from darwin.exchange.bybit.signing import Credentials
 from darwin.exchange.bybit.ws import MAINNET, TESTNET, BybitEndpoints
 from darwin.exchange.sim.venue import SimExchange
 from darwin.intelligence.factory import build_intelligence
+from darwin.market.bars import Bar
 from darwin.market.synthetic import SyntheticMarket
 from darwin.persistence.store import AuditStore
 from darwin.replay.recorder import ParquetRecorder
@@ -74,6 +75,53 @@ class Runtime:
     cleanup: list[Callable[[], Awaitable[None]]] = field(default_factory=list)
     info: dict[str, Any] = field(default_factory=dict)
     webhooks: dict[str, WebhookSignalFeed] = field(default_factory=dict)
+
+
+async def backfill_from_bybit(engine: DarwinEngine, rest: BybitRest, n: int) -> dict[str, int]:
+    """Preload the last ``n`` closed 1-minute candles per symbol (public endpoints, no keys).
+
+    Candles carry OHLCV only: trade-flow, book, liquidation and funding/OI *changes* start from
+    live data (flow is split evenly, funding/OI are held at the current ticker values), so those
+    microstructure features warm up over the first minutes rather than seeing a fake jump."""
+    if n <= 0 or engine.bar_ms != 60_000:
+        return {}
+    bars: dict[str, list[Bar]] = {}
+    for sym in engine.symbols:
+        rows = await rest.klines(sym, limit=min(1_000, n + 1))
+        tk = await rest.ticker(sym)
+        funding = float(tk.get("fundingRate") or 0.0)
+        oi = float(tk.get("openInterest") or 0.0)
+        bars[sym] = [
+            Bar(
+                symbol=sym,
+                start_ts=t,
+                end_ts=t + 60_000,
+                open=o,
+                high=h,
+                low=lo,
+                close=c,
+                volume=v,
+                buy_volume=v / 2,
+                sell_volume=v / 2,
+                n_trades=0,
+                vwap=turnover / v if v > 0 else c,
+                mark_price=c,
+                funding_rate=funding,
+                open_interest=oi,
+                book_imbalance=0.0,
+                spread_bps=0.0,
+                liq_long_notional=0.0,
+                liq_short_notional=0.0,
+                stale=False,
+            )
+            for t, o, h, lo, c, v, turnover in rows
+        ]
+    with engine.lock:
+        return engine.backfill(bars)
+
+
+def _drain_ms(cfg: ChallengeConfig) -> int:
+    return int(cfg.challenge.end_flatten_timeout_s * 1000)
 
 
 def synthetic_stream(cfg: ChallengeConfig, start_ts: int, planted: bool = True) -> Iterable[Event]:
@@ -172,7 +220,7 @@ def build_runtime(
         t0 = start_ts if start_ts is not None else (int(time.time() * 1000) // 60_000) * 60_000
         engine = DarwinEngine(cfg, run_id=run_id, start_ts=t0, store=store)
         clock = Clock(speed=cfg.sim.speed, origin_ms=t0)
-        driver = LiveDriver(engine, [], clock)
+        driver = LiveDriver(engine, [], clock, drain_timeout_ms=_drain_ms(cfg))
         driver.venues = _sim_venues(cfg, engine, driver, challenge_sim=True)
         _attach_intelligence(cfg, engine, driver)
         engine.start(seed_genomes)
@@ -197,13 +245,14 @@ def build_runtime(
     clock = clock or Clock()
     t0 = start_ts if start_ts is not None else clock.now_ms()
     engine = DarwinEngine(cfg, run_id=run_id, start_ts=t0, store=store)
-    driver = LiveDriver(engine, [], clock)
+    driver = LiveDriver(engine, [], clock, drain_timeout_ms=_drain_ms(cfg))
     market_feed = BybitMarketFeed(
         driver, cfg.challenge.symbols, endpoints.public_linear_ws, depth=cfg.exchange.orderbook_depth
     )
     engine.on_resync_needed = market_feed.resync
     cleanup: list[Callable[[], Awaitable[None]]] = []
     private_feed: BybitPrivateFeed | None = None
+    gateway: BybitExecutionGateway | None = None
     preflight: Callable[[], Awaitable[PreflightReport]] | None = None
     if mode is Mode.PAPER:
         driver.venues = _sim_venues(cfg, engine, driver, challenge_sim=True)
@@ -234,6 +283,9 @@ def build_runtime(
     _attach_intelligence(cfg, engine, driver)
     engine.start(seed_genomes)
 
+    public_rest = BybitRest(endpoints.rest, None, transport=rest_transport, clock_ms=clock.now_ms)
+    cleanup.append(public_rest.close)
+
     async def run_streams() -> float:
         if preflight is not None:
             rep = await preflight()
@@ -242,6 +294,12 @@ def build_runtime(
             log.info(
                 "preflight ok: equity=%.2f margin=%s leverage=%s", rep.equity, rep.margin_mode, rep.leverage
             )
+        try:
+            added = await backfill_from_bybit(engine, public_rest, cfg.exchange.backfill_bars)
+            if added:
+                log.info("backfilled closed 1m candles: %s", added)
+        except Exception as e:  # warm-up is a convenience: start cold rather than not at all
+            log.warning("candle backfill failed (%s); indicators warm up from live data", e)
         tasks = [asyncio.create_task(market_feed.run())]
         if private_feed is not None:
             tasks.append(asyncio.create_task(private_feed.run()))
@@ -250,6 +308,8 @@ def build_runtime(
         finally:
             for t in tasks:
                 t.cancel()
+            if gateway is not None:
+                await gateway.aclose()  # in-flight REST calls finish before the client closes
             for c in cleanup:
                 await c()
 

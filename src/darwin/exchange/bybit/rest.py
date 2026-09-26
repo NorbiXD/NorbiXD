@@ -35,6 +35,10 @@ LEVERAGE_NOT_MODIFIED = 110043
 POSITION_MODE_NOT_MODIFIED = 110025
 
 
+#: (start_ms, open, high, low, close, volume, turnover)
+Kline = tuple[int, float, float, float, float, float, float]
+
+
 class BybitApiError(Exception):
     def __init__(self, ret_code: int, ret_msg: str, path: str) -> None:
         super().__init__(f"{path}: {ret_code} {ret_msg}")
@@ -118,6 +122,28 @@ class BybitRest:
                     max_leverage=float(lev.get("maxLeverage") or 50),
                 )
         return out
+
+    async def klines(self, symbol: str, limit: int = 1_000) -> list[Kline]:
+        """Recent 1-minute candles, oldest first: (start_ms, open, high, low, close, volume,
+        turnover). Bybit returns newest first and includes the still-forming candle."""
+        res = await self._request(
+            "GET",
+            "/v5/market/kline",
+            {"category": "linear", "symbol": symbol, "interval": "1", "limit": limit},
+            signed=False,
+        )
+        rows = [
+            (int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5]), float(r[6]))
+            for r in res.get("list", [])
+        ]
+        return sorted(rows)
+
+    async def ticker(self, symbol: str) -> dict[str, Any]:
+        res = await self._request(
+            "GET", "/v5/market/tickers", {"category": "linear", "symbol": symbol}, signed=False
+        )
+        rows = res.get("list", [])
+        return rows[0] if rows else {}
 
     async def server_time_ms(self) -> int:
         res = await self._request("GET", "/v5/market/time", signed=False)

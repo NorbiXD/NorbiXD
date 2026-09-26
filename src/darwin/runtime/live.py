@@ -153,6 +153,7 @@ class LiveDriver:
         flusher = asyncio.create_task(self._flusher())
         next_hb = self.clock.now_ms() + self.heartbeat_ms
         ended_at: int | None = None
+        last_alert: int | None = None
         try:
             while not self.stop.is_set():
                 now = self.clock.now_ms()
@@ -178,7 +179,13 @@ class LiveDriver:
                             bool(eng.execution.open_orders()) or bool(self._heap) or eng.flatten_pending()
                         )
                     if not in_flight:
+                        with eng.lock:
+                            eng.enforce_flat()
                         break
+                    if now - ended_at >= 60_000 and (last_alert is None or now - last_alert >= 60_000):
+                        last_alert = now
+                        with eng.lock:
+                            eng.flatten_overdue(now - ended_at)
                     if now - ended_at > self.drain_timeout_ms:
                         with eng.lock:
                             eng.flatten_incomplete()

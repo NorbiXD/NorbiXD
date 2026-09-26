@@ -349,3 +349,42 @@ def test_default_synthetic_stream_uses_deltas_with_gaps() -> None:
     h = build_replay(cfg, iter(evs), T0)
     h.driver.run()
     assert h.engine.stats["book_invalid"] > 0 and h.engine.stats["orders"] > 0  # gaps detected, recovered
+
+
+# ----------------------------------------------------------------------------- warm start
+
+
+async def test_bybit_candle_backfill_warms_indicators_without_touching_evidence() -> None:
+    """Paper/testnet/live start with no history: without a warm-up the fast AI path (needs 60
+    bars) and long-lookback agents stayed idle for up to hours."""
+    import httpx
+
+    from darwin.exchange.bybit.rest import BybitRest
+    from darwin.runtime.app import backfill_from_bybit
+
+    forming = (T0 // 60_000) * 60_000  # Bybit candles are minute-aligned
+    start = forming + 37_000  # mid-bar: the candle starting at `forming` is still open
+    h = build_replay(make_config(), iter([]), start)
+    eng = h.engine
+    t_first = forming - 200 * 60_000
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/v5/market/kline":
+            rows = [
+                [str(t), "100", "101", "99", str(100 + (t - t_first) / 6e6), "5", "500"]
+                for t in range(t_first, forming + 60_000, 60_000)  # includes the forming candle
+            ][::-1]  # Bybit: newest first
+            return httpx.Response(200, json={"retCode": 0, "result": {"list": rows}})
+        if req.url.path == "/v5/market/tickers":
+            body = {"list": [{"fundingRate": "0.0001", "openInterest": "12345"}]}
+            return httpx.Response(200, json={"retCode": 0, "result": body})
+        return httpx.Response(404)
+
+    rest = BybitRest("https://bybit.test", None, transport=httpx.MockTransport(handler))
+    added = await backfill_from_bybit(eng, rest, 800)
+    await rest.close()
+    assert added == {"BTCUSDT": 200, "ETHUSDT": 200}  # the forming candle was dropped
+    view = eng.features.view("BTCUSDT", start)
+    assert view.ready(60) and view.bars[-1].end_ts == forming  # warm now, nothing from the future
+    assert eng.bar_index == 0 and not eng.population.books[next(iter(eng.population.books))].equity
+    assert eng.ledger["challenge"].cash == eng.cfg.challenge.starting_capital

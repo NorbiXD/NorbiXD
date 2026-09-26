@@ -27,7 +27,9 @@ from tests.test_flatten import fund_everyone
 SPEED = 1_500.0
 
 
-async def test_testnet_mode_trades_reconciles_and_ends_flat(monkeypatch: pytest.MonkeyPatch) -> None:
+async def _run_testnet(
+    monkeypatch: pytest.MonkeyPatch, tweak: Any = None
+) -> tuple[Any, FakeBybitExchange, Any, float, list[str]]:
     monkeypatch.setenv("BYBIT_TESTNET_API_KEY", "test-key")
     monkeypatch.setenv("BYBIT_TESTNET_API_SECRET", "test-secret")
     t0 = 1_700_000_040_000
@@ -66,8 +68,14 @@ async def test_testnet_mode_trades_reconciles_and_ends_flat(monkeypatch: pytest.
         eng = rt.engine
         eng.allocator.allocate = fund_everyone  # type: ignore[method-assign]
         fake.mark = lambda s: eng.market[s].ref_price()
+        if tweak is not None:
+            tweak(fake, eng, clock)
         final = await asyncio.wait_for(rt.run(), timeout=90)
+    return eng, fake, cfg, final, symbols
 
+
+async def test_testnet_mode_trades_reconciles_and_ends_flat(monkeypatch: pytest.MonkeyPatch) -> None:
+    eng, fake, cfg, final, symbols = await _run_testnet(monkeypatch)
     paths = [p for p, _ in fake.calls]
     # preflight: wallet, flatness, open orders, margin mode, one-way, per-symbol leverage
     for p in ("/v5/account/wallet-balance", "/v5/position/list", "/v5/order/realtime", "/v5/account/info"):
@@ -93,3 +101,22 @@ async def test_testnet_mode_trades_reconciles_and_ends_flat(monkeypatch: pytest.
     venue_pnl = fake.equity() - 1_000.0
     ledger_pnl = eng.ledger[CHALLENGE].equity(eng._marks()) - cfg.challenge.starting_capital
     assert venue_pnl == pytest.approx(ledger_pnl, abs=0.05)
+
+
+async def test_testnet_keeps_flattening_past_the_old_60s_cutoff_when_exits_are_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """QM iteration 3, M3: the live driver used to give up 60 s after the end with positions open."""
+
+    def tweak(fake: FakeBybitExchange, eng: Any, clock: Clock) -> None:
+        # every order is refused (retryable rate limit) from the end until 5 minutes after it
+        fake.reject_create = lambda: eng.end_ts <= clock.now_ms() < eng.end_ts + 300_000
+
+    eng, fake, _cfg, _final, _symbols = await _run_testnet(monkeypatch, tweak)
+    assert fake.rejected_creates >= 1  # exits were really refused after the end
+    assert eng.now - eng.end_ts > 240_000  # kept going well past the old 60 s give-up
+    assert eng.stats["sys:flatten_overdue"] >= 1  # and said so every minute
+    assert eng.stats["sys:flatten_complete"] == 1 and eng.stats["sys:flatten_incomplete"] == 0
+    assert not eng.ledger[CHALLENGE].open_positions() and not eng.execution.open_orders()
+    assert all(q == 0 for q, _ in fake.positions.values())
+    assert not eng.gateways[CHALLENGE_VENUE]._tasks  # REST work drained before the client closed

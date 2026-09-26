@@ -196,6 +196,9 @@ class FakeBybitExchange:
         self.execs: dict[str, list[dict[str, Any]]] = {}
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.mark: Callable[[str], float | None] = lambda _s: None
+        #: when this returns True, order creation fails with a retryable error (rate limit)
+        self.reject_create: Callable[[], bool] = lambda: False
+        self.rejected_creates = 0
         self._ids = itertools.count(1)
 
     # ---- accounting
@@ -241,6 +244,11 @@ class FakeBybitExchange:
         elif path == "/v5/position/list":
             ok["result"] = {"list": [self._position_row(s) for s in self.positions]}
         elif path == "/v5/order/create":
+            if self.reject_create():
+                self.rejected_creates += 1
+                return httpx.Response(
+                    200, json={"retCode": 10006, "retMsg": "Too many visits!", "result": {}}
+                )
             ok["result"] = self._create(args)
         elif path == "/v5/order/cancel":
             o = self.orders.get(args["orderLinkId"])
@@ -260,6 +268,8 @@ class FakeBybitExchange:
             ok["result"] = {"list": [o] if o else []}
         elif path == "/v5/execution/list":
             ok["result"] = {"list": self.execs.get(args.get("orderLinkId", ""), [])}
+        elif path in ("/v5/market/kline", "/v5/market/tickers"):
+            ok["result"] = {"list": []}  # no history: the run starts cold
         else:
             return httpx.Response(404)
         return httpx.Response(200, json=ok)

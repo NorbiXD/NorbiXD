@@ -50,7 +50,7 @@ from darwin.core.events import (
 )
 from darwin.core.ids import Sequence, content_hash
 from darwin.core.intent import IntentReason, TradeIntent
-from darwin.core.types import AgentStatus, LineageEventKind
+from darwin.core.types import AgentStatus, LineageEventKind, Side
 from darwin.evolution.allocator import AllocationCandidate, make_allocator
 from darwin.evolution.fitness import TradeSample
 from darwin.evolution.population import EvolutionResult, LineageEvent, Population
@@ -71,6 +71,11 @@ SHADOW_VENUE = "shadow"
 CHALLENGE_VENUE = "challenge"
 
 BarObserver = Callable[["DarwinEngine", int, dict[str, FeatureView]], None]
+
+
+#: owner of positions the venue holds but no agent does (manual trades, lost fills): adopted only
+#: to get them closed through the normal governed, persisted exit path
+SYSTEM_AGENT = "SYSTEM"
 
 
 def shadow_account(agent_id: str) -> str:
@@ -327,6 +332,30 @@ class DarwinEngine:
         elif ev.feed.startswith("private"):
             self.health[CHALLENGE_VENUE].connected = ev.status in ("connected", "resync")
 
+    def backfill(self, bars: dict[str, list[Bar]]) -> dict[str, int]:
+        """Warm the feature history with bars that closed *before* the challenge started.
+
+        Indicators only: nothing is marked, no agent decides, no evidence or fitness is recorded,
+        so a backfill cannot leak into selection. Bars that are not strictly older than the
+        currently open bar are dropped (Bybit's latest candle is still forming)."""
+        cutoff = self.next_bar_ts - self.bar_ms
+        added: dict[str, int] = {}
+        for sym, rows in bars.items():
+            if sym not in self.builders:
+                continue
+            n = 0
+            for bar in sorted(rows, key=lambda b: b.end_ts):
+                hist = self.features.history[sym]
+                if bar.end_ts > cutoff or (hist and bar.end_ts <= hist[-1].end_ts):
+                    continue
+                self.features.add_bar(bar)
+                self.builders[sym].prev_close = bar.close
+                n += 1
+            added[sym] = n
+        self.stats["backfilled_bars"] += sum(added.values())
+        self._system_event("backfill", {"bars": added})
+        return added
+
     def advance_to(self, ts: int) -> None:
         """Close any bars that ended before ``ts`` (used by drivers at end of stream)."""
         if ts > self.now:
@@ -503,7 +532,12 @@ class DarwinEngine:
                 self.execution.reservations(acct_id),
             )
             self._persist_decision(decision)
-            mo = self.execution.submit(decision, intent, self.now) if decision.approved else None
+            reduce_only = aid == SYSTEM_AGENT and not decision.risk_increasing
+            mo = (
+                self.execution.submit(decision, intent, self.now, reduce_only=reduce_only)
+                if decision.approved
+                else None
+            )
             if mo is not None:
                 self.stats["orders"] += 1
                 self._persist_order(mo)
@@ -668,6 +702,9 @@ class DarwinEngine:
             if acct_id not in self.ledger.accounts:
                 continue
             self.execution.cancel_open(acct_id, self.now)
+            if acct_id == CHALLENGE:
+                self._adopt_venue_residuals()
+            self._cross_internal(acct_id)
             self._flatten_account(acct_id, reason)
             if (
                 acct_id == CHALLENGE
@@ -689,9 +726,105 @@ class DarwinEngine:
             else:
                 self.flat_confirmed.discard(acct_id)
 
+    def enforce_flat(self) -> None:
+        """Run one flatten pass now (drivers call this before stopping, so the final state —
+        e.g. ``flatten_complete`` — is recorded even if the last fill landed between heartbeats)."""
+        self._enforce_flat()
+
     def flatten_pending(self) -> bool:
         """True while some account under a flatten condition is not yet flat."""
         return any(a in self.ledger.accounts and not self.is_flat(a) for a, _ in self._flatten_targets())
+
+    def _adopt_venue_residuals(self) -> None:
+        """Under a flatten condition only: a position the venue reports on two consecutive
+        snapshots that the ledger does not hold (a manual trade, lost fills) is adopted into a
+        ``SYSTEM`` sub-position at the current price, so the normal governed, persisted exit path
+        closes it (with ``reduceOnly``, which can never open or flip a position)."""
+        acct = self.ledger[CHALLENGE]
+        for sym, venue_qty in sorted(self.venue_positions.items()):
+            key = (CHALLENGE, sym)
+            if self._mismatches.get(key, 0) < 2 or self.execution.has_open(CHALLENGE, sym):
+                continue
+            residual = venue_qty - acct.net_qty(sym)
+            step = self.instruments[sym].qty_step if sym in self.instruments else 1e-9
+            price = self.market[sym].ref_price() or self.marks.get(sym)
+            if abs(residual) <= step / 2 or not price:
+                continue
+            self.ledger.on_fill(
+                account_id=CHALLENGE,
+                agent_id=SYSTEM_AGENT,
+                genome_id="",
+                symbol=sym,
+                side=Side.BUY if residual > 0 else Side.SELL,
+                qty=abs(residual),
+                price=price,
+                fee=0.0,
+                ts=self.now,
+                intent_id=None,
+                intent_reason="orphan_adopted",
+                confidence=0.0,
+                ref_price=None,
+                equity_hint=acct.last_equity,
+            )
+            self._mismatches[key] = 0
+            self.stats["orphans_adopted"] += 1
+            log.warning("adopted venue-only %s position %+g into %s to close it", sym, residual, SYSTEM_AGENT)
+            self._system_event(
+                "orphan_adopted",
+                {"symbol": sym, "qty": residual, "price": price, "venue_qty": venue_qty},
+            )
+
+    def _cross_internal(self, account: str) -> None:
+        """Sub-positions that exactly offset each other on a symbol are closed against each other
+        in the books at the current price: the venue holds nothing, so no order is needed (and
+        sending both legs would open a transient position and pay fees twice)."""
+        acct = self.ledger[account]
+        by_sym: dict[str, list[tuple[str, float]]] = {}
+        for aid, sym, pos in acct.open_positions():
+            by_sym.setdefault(sym, []).append((aid, pos.qty))
+        for sym, legs in by_sym.items():
+            step = self.instruments[sym].qty_step if sym in self.instruments else 1e-9
+            price = self.market[sym].ref_price() or self.marks.get(sym)
+            if len(legs) < 2 or abs(sum(q for _, q in legs)) > step / 2 or not price:
+                continue
+            if self.execution.has_open(account, sym):
+                continue
+            for aid, qty in legs:
+                closed = self.ledger.on_fill(
+                    account_id=account,
+                    agent_id=aid,
+                    genome_id="",
+                    symbol=sym,
+                    side=Side.SELL if qty > 0 else Side.BUY,
+                    qty=abs(qty),
+                    price=price,
+                    fee=0.0,
+                    ts=self.now,
+                    intent_id=None,
+                    intent_reason="internal_cross",
+                    confidence=0.0,
+                    ref_price=None,
+                    equity_hint=acct.last_equity,
+                )
+                for rt in closed:
+                    self._on_trade_closed(rt)
+            self.stats["internal_crosses"] += 1
+            self._system_event("internal_cross", {"account": account, "symbol": sym, "legs": legs})
+
+    def flatten_overdue(self, elapsed_ms: int) -> None:
+        """Escalating alert from the live driver: the challenge ended and we are still not flat."""
+        left = {
+            a: [(aid, sym, p.qty) for aid, sym, p in self.ledger[a].open_positions()]
+            for a, _ in self._flatten_targets()
+            if a in self.ledger.accounts and not self.is_flat(a)
+        }
+        log.error(
+            "challenge ended %.0f s ago and the account is still not flat: %s venue=%s",
+            elapsed_ms / 1000,
+            left,
+            self.venue_positions,
+        )
+        self._system_event("flatten_overdue", {"elapsed_ms": elapsed_ms, "open": left})
 
     def flatten_incomplete(self) -> None:
         """Drivers call this when they stop with a flatten condition still unmet."""
@@ -950,7 +1083,7 @@ class DarwinEngine:
         # orders in flight, or a fill in the last few seconds (the snapshot may predate it), make a
         # transient mismatch legitimate; a real one must persist over two consecutive snapshots
         key = (ev.account, ev.symbol)
-        in_flight = self.execution.has_open(ev.account, ev.symbol)
+        in_flight = self.execution.has_open(ev.account, ev.symbol, now=self.now)
         recent_fill = self.now - self._last_fill_ts.get(key, -(10**15)) < self.RECONCILE_GRACE_MS
         mismatch = abs(internal - ev.qty) > step / 2
         if mismatch and (in_flight or recent_fill):
@@ -960,10 +1093,11 @@ class DarwinEngine:
             h.reconcile_ok = False
             h.reconcile_detail = f"{ev.account}:{ev.symbol} internal={internal} venue={ev.qty}"
             self.stats["reconcile_mismatch"] += 1
-            self._system_event(
-                "reconcile_mismatch",
-                {"account": ev.account, "symbol": ev.symbol, "internal": internal, "venue": ev.qty},
-            )
+            if self._mismatches[key] == 2:  # one event per episode, not one per snapshot
+                self._system_event(
+                    "reconcile_mismatch",
+                    {"account": ev.account, "symbol": ev.symbol, "internal": internal, "venue": ev.qty},
+                )
         elif not h.reconcile_ok and h.reconcile_detail.startswith(f"{ev.account}:{ev.symbol}"):
             h.reconcile_ok = True
             h.reconcile_detail = ""
@@ -993,8 +1127,8 @@ class DarwinEngine:
         if self.venue_equity_base is None:
             self.venue_equity_base, self.ledger_equity_base = ev.equity, ledger_eq
             return
-        if self.execution.open_orders():
-            return  # fills in flight make a transient difference legitimate
+        if self.execution.has_recent_open(CHALLENGE, self.now):
+            return  # fills in flight make a transient difference legitimate (bounded in time)
         assert self.ledger_equity_base is not None
         drift = (ev.equity - self.venue_equity_base) - (ledger_eq - self.ledger_equity_base)
         tol = max(1.0, 0.02 * self.cfg.challenge.starting_capital)

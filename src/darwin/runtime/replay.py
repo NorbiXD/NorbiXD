@@ -116,6 +116,7 @@ class ReplayDriver:
                 # let timers resolve timeouts and retry exits, then drain again
                 eng.handle(TimerEvent(ts=eng.now + hb_ms, name="heartbeat"))
                 if not self._heap and not eng.execution.open_orders() and not eng.flatten_pending():
+                    eng.enforce_flat()
                     break
             return eng.finalize()
 

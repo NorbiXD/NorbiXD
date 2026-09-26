@@ -75,6 +75,8 @@ class Chaos:
 class _SimOrder:
     req: OrderRequest
     status: OrderStatus = OrderStatus.NEW
+    #: executions, replayed on query like Bybit's /v5/execution/list (the engine dedupes)
+    fills: list[FillEvent] = field(default_factory=list)
     cum_qty: float = 0.0
     notional: float = 0.0
     exchange_order_id: str = ""
@@ -334,6 +336,7 @@ class SimExchange:
             is_maker=is_maker,
             is_liquidation=liquidation,
         )
+        o.fills.append(fill)
         self._emit(ts, fill)
         if self.chaos.duplicate_fill_prob and self.rng.random() < self.chaos.duplicate_fill_prob:
             self._emit(ts + 1, fill)  # at-least-once delivery: the engine must dedupe by exec_id
@@ -445,6 +448,8 @@ class SimExchange:
                 ),
             )
             return
+        for f in o.fills:  # replay executions first (idempotent by exec_id), then the state
+            self._emit(ack, f.model_copy(update={"ts": ack}))
         self._emit(ack, self._update(o, ack, "query"))
 
     def _check_liquidations(self, symbol: str, ts: int) -> None:

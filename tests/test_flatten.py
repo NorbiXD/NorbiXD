@@ -360,3 +360,97 @@ def test_stop_loss_exit_goes_through_while_an_increasing_order_is_working() -> N
     assert len([o for o in eng.execution.orders.values() if o.intent_reason == "stop_loss"]) == 2
     assert eng.ledger[CHALLENGE].agent_qty("A0001", "ETHUSDT") == pytest.approx(0.0, abs=1e-12)
     assert not eng.execution.open_orders()
+
+
+def test_lost_terminal_updates_and_fills_of_exits_are_recovered_by_query_and_flatten_completes() -> None:
+    """QM iteration 3, M1: an exit whose ACK arrived but whose Filled update *and* executions were
+    lost used to stay "New" forever, blocking further exits and hiding the position mismatch."""
+    from darwin.core.events import FillEvent, OrderUpdate
+
+    steps: list[Step] = []
+    h, script = funded_replay(steps)
+    lossy: set[str] = set()
+    dropped = {"n": 0}
+    real_emit = h.challenge._emit
+
+    def emit(ts: int, ev: Any) -> None:
+        cid = getattr(ev, "client_order_id", None)
+        is_final = isinstance(ev, FillEvent) or (isinstance(ev, OrderUpdate) and ev.status.terminal)
+        if cid in lossy and is_final and ev.ts < script.log.get("kill", 0) + 3_000:
+            dropped["n"] += 1  # the venue executed it; only the reports are lost
+            return
+        real_emit(ts, ev)
+
+    h.challenge._emit = emit  # type: ignore[method-assign]
+    real_submit = h.challenge.submit
+
+    def submit(order: OrderRequest) -> None:
+        if "kill" in script.log and not any(o.startswith(order.client_order_id[:-8]) for o in lossy):
+            lossy.add(order.client_order_id)  # the first exit per agent loses its final reports
+        real_submit(order)
+
+    h.challenge.submit = submit  # type: ignore[method-assign]
+    t_kill = T0 + 90 * 60_000
+
+    def kill(eng: DarwinEngine, ts: int) -> None:
+        script.log["kill"] = ts
+        script.log["positions"] = len(eng.ledger[CHALLENGE].open_positions())
+        eng.governor.engage_kill_switch()
+
+    steps += [Step(t_kill, kill, has_positions), watch_flat(script, "flat", t_kill)]
+    h.driver.run()
+    eng = h.engine
+    assert lossy and dropped["n"] >= len(lossy)
+    stuck = [eng.execution.orders[c] for c in lossy]
+    assert all(o.status.terminal and not o.open for o in stuck), [o.status for o in stuck]
+    assert all(o.queries >= 1 for o in stuck)  # recovered by querying the venue
+    # executions were replayed by the query, so the exits counted once: no double exit
+    assert script.log["flat"] - script.log["kill"] <= 60_000
+    assert eng.stats["sys:flatten_incomplete"] == 0
+    assert_everything_flat(h)
+
+
+def test_a_position_that_only_the_venue_holds_is_adopted_and_closed_under_kill() -> None:
+    """QM iteration 3, M2: a fill the engine cannot attribute (manual trade, lost state) left a
+    venue position that flatten never closed."""
+    from darwin.core.events import FillEvent
+    from darwin.core.types import Side
+    from darwin.runtime.engine import SYSTEM_AGENT
+
+    steps: list[Step] = []
+    h, script = funded_replay(steps)
+    t_orphan = T0 + 80 * 60_000
+
+    def manual_trade(eng: DarwinEngine, ts: int) -> None:
+        price = eng.market["ETHUSDT"].ref_price() or 3_000.0
+        h.challenge._apply_position(CHALLENGE, "ETHUSDT", Side.BUY, 0.05, price, 0.08)
+        orphan = FillEvent(
+            ts=ts + 50,
+            account=CHALLENGE,
+            client_order_id="manual-from-phone",
+            exec_id="manual-1",
+            symbol="ETHUSDT",
+            side=Side.BUY,
+            qty=0.05,
+            price=price,
+            fee=0.08,
+        )
+        h.challenge._emit(ts + 50, orphan)
+        script.log["orphan"] = ts
+
+    def kill(eng: DarwinEngine, ts: int) -> None:
+        script.log["kill"] = ts
+        eng.governor.engage_kill_switch()
+
+    steps += [Step(t_orphan, manual_trade)]
+    steps += [Step(t_orphan + 5 * 60_000, kill, lambda e: "orphan" in script.log)]
+    steps += [watch_flat(script, "flat", t_orphan + 5 * 60_000)]
+    h.driver.run()
+    eng = h.engine
+    assert eng.execution.orphans and eng.stats["sys:orphan_adopted"] == 1
+    closes = [o for o in eng.execution.orders.values() if o.agent_id == SYSTEM_AGENT]
+    assert closes and all(o.request.reduce_only and not o.risk_increasing for o in closes)
+    assert script.log["flat"] - script.log["kill"] <= 3 * 60_000
+    assert eng.stats["sys:reconcile_mismatch"] <= 2  # one event per episode, not per snapshot
+    assert eng.stats["sys:flatten_incomplete"] == 0
+    assert_everything_flat(h)

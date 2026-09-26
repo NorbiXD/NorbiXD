@@ -265,5 +265,5 @@ class IntelligenceService:
             self.deliver(arrive_ts, sig)
 
     async def drain(self) -> None:
-        while self._tasks:
-            await asyncio.gather(*list(self._tasks), return_exceptions=True)
+        while pending := [t for t in self._tasks if not t.done()]:  # see BybitExecutionGateway.drain
+            await asyncio.gather(*pending, return_exceptions=True)

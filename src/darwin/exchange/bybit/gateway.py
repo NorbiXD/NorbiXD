@@ -67,7 +67,20 @@ class BybitExecutionGateway:
         task.add_done_callback(self._tasks.discard)
 
     async def drain(self) -> None:
-        while self._tasks:
+        # wait only on unfinished tasks: since Python 3.12 gather() over already-finished tasks
+        # completes without yielding, so looping on the set (whose done-callbacks never get to
+        # run) spins forever and starves the event loop, timeouts included
+        while pending := [t for t in self._tasks if not t.done()]:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    async def aclose(self, timeout_s: float = 10.0) -> None:
+        """Let in-flight REST calls finish (bounded), then cancel the rest — before the REST
+        client is closed underneath them."""
+        try:
+            await asyncio.wait_for(self.drain(), timeout=timeout_s)
+        except TimeoutError:
+            for t in list(self._tasks):
+                t.cancel()
             await asyncio.gather(*list(self._tasks), return_exceptions=True)
 
     # ------------------------------------------------------------------ ExecutionGateway

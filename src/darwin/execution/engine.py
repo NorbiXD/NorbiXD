@@ -134,9 +134,20 @@ class ExecutionEngine:
                 new_pos.add((o.agent_id, o.symbol))
         return Reservations(qty_by_symbol=qty, new_positions=len(new_pos))
 
-    def has_open(self, account: str, symbol: str) -> bool:
+    def has_open(self, account: str, symbol: str, now: int | None = None, max_age_ms: int = 60_000) -> bool:
+        """Open orders on ``account``/``symbol``; with ``now``, only those younger than
+        ``max_age_ms`` (a stuck order must not excuse a position mismatch forever)."""
         return any(
-            self.orders[i].account == account and self.orders[i].symbol == symbol for i in self._open_ids
+            (o := self.orders[i]).account == account
+            and o.symbol == symbol
+            and (now is None or now - o.created_ts < max_age_ms)
+            for i in self._open_ids
+        )
+
+    def has_recent_open(self, account: str, now: int, max_age_ms: int = 60_000) -> bool:
+        return any(
+            (o := self.orders[i]).account == account and now - o.created_ts < max_age_ms
+            for i in self._open_ids
         )
 
     def has_open_account(self, account: str) -> bool:
@@ -150,7 +161,9 @@ class ExecutionEngine:
         # orderLinkIds must never collide with a previous run's), <= 36 chars
         return f"{prefix}{self.run_tag}-{agent_id[-8:]}-{self._seq:07d}"
 
-    def submit(self, decision: RiskDecision, intent: TradeIntent, now: int) -> ManagedOrder | None:
+    def submit(
+        self, decision: RiskDecision, intent: TradeIntent, now: int, reduce_only: bool = False
+    ) -> ManagedOrder | None:
         if not decision.approved or decision.order_qty == 0:
             return None
         venue = self.account_venue(decision.account_id)
@@ -193,7 +206,9 @@ class ExecutionEngine:
             order_type=order_type,
             tif=tif,
             limit_price=price,
-            reduce_only=False,  # one-way netting across agents makes per-agent reduce-only unsafe
+            # one-way netting across agents makes per-agent reduce-only unsafe in general; callers
+            # set it only for account-level closes (SYSTEM), where it rules out opening or flipping
+            reduce_only=reduce_only and not decision.risk_increasing,
             ts=now,
         )
         mo = ManagedOrder(
@@ -401,25 +416,37 @@ class ExecutionEngine:
                     mo.last_update_ts = now
                     gw.query_order(mo.account, mo.client_order_id, mo.symbol, now)
                 continue
-            if mo.acked_ts is None and now - mo.last_update_ts >= self.ack_timeout_ms:
-                if mo.queries >= self.max_queries:
-                    mo.status = OrderStatus.UNKNOWN
-                    mo.last_update_ts = now
-                    self.health[venue].consecutive_errors += 1
-                    self.health[venue].reconcile_ok = False
-                    self.health[venue].reconcile_detail = f"order {mo.client_order_id} unknown"
-                    continue
-                mo.queries += 1
-                mo.last_update_ts = now
-                gw.query_order(mo.account, mo.client_order_id, mo.symbol, now)
-            elif (
-                mo.request.tif is TimeInForce.POST_ONLY
-                and mo.status in (OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED)
+            resting = mo.request.tif is TimeInForce.POST_ONLY
+            if (
+                resting
+                and mo.acked_ts is not None
+                and mo.cancel_requested_ts is None
                 and now - mo.created_ts >= self.passive_ttl_ms
-                and now - mo.last_update_ts >= self.ack_timeout_ms
             ):
+                mo.cancel_requested_ts = now
                 mo.last_update_ts = now
                 gw.cancel(mo.account, mo.client_order_id, mo.symbol, now)
+                continue
+            if mo.acked_ts is None:
+                quiet_limit = self.ack_timeout_ms  # no ACK yet
+            elif resting and mo.cancel_requested_ts is None:
+                quiet_limit = 10 * self.ack_timeout_ms  # legitimately resting on the book
+            else:
+                # acknowledged but its final state never arrived (IOC, or a resting order we
+                # cancelled): the terminal update or the executions were lost — ask
+                quiet_limit = 2 * self.ack_timeout_ms
+            if now - mo.last_update_ts < quiet_limit:
+                continue
+            if mo.queries >= self.max_queries:
+                mo.status = OrderStatus.UNKNOWN
+                mo.last_update_ts = now
+                self.health[venue].consecutive_errors += 1
+                self.health[venue].reconcile_ok = False
+                self.health[venue].reconcile_detail = f"order {mo.client_order_id} unknown"
+                continue
+            mo.queries += 1
+            mo.last_update_ts = now
+            gw.query_order(mo.account, mo.client_order_id, mo.symbol, now)
 
     def prune(self, now: int, keep_ms: int = 3_600_000) -> int:
         """Forget resolved orders older than ``keep_ms`` and bound the exec-id memory."""

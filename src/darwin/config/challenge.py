@@ -45,6 +45,9 @@ class ChallengeSettings(_Frozen):
     symbols: tuple[str, ...] = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
     bar_ms: int = Field(default=60_000, ge=1_000)
     flatten_at_end: bool = True
+    #: after the end, keep the process alive this long while positions or orders remain (with an
+    #: alert every minute) instead of walking away from an exposed account
+    end_flatten_timeout_s: float = Field(default=1_800.0, ge=60)
 
 
 class ExchangeSettings(_Frozen):
@@ -56,6 +59,9 @@ class ExchangeSettings(_Frozen):
     recv_window_ms: int = 5_000
     order_ack_timeout_ms: int = 3_000
     reconcile_interval_ms: int = 15_000
+    #: paper/testnet/live: preload this many closed 1-minute candles per symbol from Bybit at start
+    #: so indicators (and the fast AI path, which needs 60 bars) are warm immediately; 0 disables
+    backfill_bars: int = Field(default=800, ge=0, le=1_000)
 
 
 class LatencyModel(_Frozen):
