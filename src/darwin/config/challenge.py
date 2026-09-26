@@ -198,6 +198,8 @@ class AllocatorSettings(_Frozen):
 class PersistenceSettings(_Frozen):
     database_url: str = "sqlite:///./darwin.db"
     parquet_dir: str = "./data"
+    #: record every market event / signal of sim, paper, testnet and live runs to Parquet
+    record_market_data: bool = True
     flush_every_events: int = Field(default=2_000, ge=1)
 
 
@@ -216,6 +218,8 @@ class ProviderSettings(_Frozen):
 
 
 class IntelligenceSettings(_Frozen):
+    #: names of authenticated webhook feeds; secret in env DARWIN_WEBHOOK_SECRET_<NAME>
+    external_webhooks: tuple[str, ...] = ()
     jev: ProviderSettings = ProviderSettings(base_url="https://api.typesafe.ai")
     grok: ProviderSettings = ProviderSettings(base_url="https://api.x.ai", interval_s=900.0)
     mock: ProviderSettings = ProviderSettings(enabled=True)

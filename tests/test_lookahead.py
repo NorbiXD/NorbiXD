@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+import pytest
 
 from darwin.core.events import Event, IntelligenceSignal, LiquidationEvent, TickerEvent, TradeEvent
 from darwin.core.types import Side
@@ -66,8 +67,8 @@ def _perturb(events: list[Event], t_cut: int, seed: int = 99) -> list[Event]:
     return out
 
 
-def _run(events: list[Event], cfg: Any) -> dict[str, list[Any]]:
-    h = build_replay(cfg, iter(events), T0)
+def _run(events: list[Event], cfg: Any, intelligence: bool = False) -> dict[str, list[Any]]:
+    h = build_replay(cfg, iter(events), T0, intelligence=intelligence)
     rec: dict[str, list[Any]] = {"intents": [], "decisions": [], "fills": [], "lineage": [], "weights": []}
     eng = h.engine
     orig_route = eng._route
@@ -88,7 +89,8 @@ def _run(events: list[Event], cfg: Any) -> dict[str, list[Any]]:
     return rec
 
 
-def test_future_perturbation_does_not_change_past_decisions() -> None:
+@pytest.mark.parametrize("intelligence", [False, True], ids=["quant-only", "with-intelligence"])
+def test_future_perturbation_does_not_change_past_decisions(intelligence: bool) -> None:
     cfg = make_config(
         challenge={"duration_hours": 6},
         evolution={"population_size": 10, "generation_bars": 60, "min_trades": 2, "min_age_generations": 0},
@@ -103,8 +105,8 @@ def test_future_perturbation_does_not_change_past_decisions() -> None:
     )
     base = list(market.events())
     t_cut = T0 + 4 * HOUR  # after several generations of evolution
-    a = _run(base, cfg)
-    b = _run(_perturb(base, t_cut), cfg)
+    a = _run(base, cfg, intelligence)
+    b = _run(_perturb(base, t_cut), cfg, intelligence)
 
     def upto(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return [r for r in rows if r["ts"] <= t_cut]

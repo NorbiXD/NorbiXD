@@ -29,6 +29,7 @@ from darwin.core.events import (
     Event,
     FeedStatus,
     FundingSettlement,
+    IntelligenceSignal,
     LiquidationEvent,
     TickerEvent,
     TimerEvent,
@@ -36,6 +37,7 @@ from darwin.core.events import (
 )
 from darwin.exchange.scheduler import EventTarget
 from darwin.exchange.sim.venue import SimExchange
+from darwin.replay.recorder import ParquetRecorder
 from darwin.runtime.engine import DarwinEngine
 
 log = logging.getLogger(__name__)
@@ -82,6 +84,7 @@ class LiveDriver:
         self.stop = asyncio.Event()
         self.events = 0
         self.restamped = 0
+        self.recorder: ParquetRecorder | None = None
 
     # Scheduler protocol (simulated venues) ------------------------------------
     def schedule(self, ts: int, event: Event, target: EventTarget) -> None:
@@ -101,6 +104,8 @@ class LiveDriver:
 
     def _dispatch(self, ev: Event) -> None:
         ev = self._restamp(ev)
+        if self.recorder is not None:
+            self.recorder.record(ev)
         if isinstance(ev, _MARKET_TYPES):
             for v in self.venues:
                 v.on_market(ev)
@@ -120,7 +125,10 @@ class LiveDriver:
                 eng.handle(TimerEvent(ts=t_bar, name="bar"))
             else:
                 _, _s, target, ev = heapq.heappop(self._heap)
-                target.handle(self._restamp(ev))
+                ev = self._restamp(ev)
+                if self.recorder is not None and isinstance(ev, IntelligenceSignal):
+                    self.recorder.record(ev)
+                target.handle(ev)
                 self.events += 1
 
     async def _flusher(self) -> None:
@@ -162,6 +170,8 @@ class LiveDriver:
                         break
         finally:
             self.stop.set()
+            if self.recorder is not None:
+                self.recorder.flush()
             flusher.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await flusher

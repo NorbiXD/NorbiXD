@@ -130,7 +130,7 @@ def _contrarian(v: FeatureView, p: Mapping[str, float]) -> float:
     return 0.0
 
 
-SIGNAL_TOPICS = ("", "x_narrative", "jev_direction", "external")
+SIGNAL_TOPICS = ("", "x_narrative", "model_direction", "external")
 
 
 def _narrative(v: FeatureView, p: Mapping[str, float]) -> float:
@@ -225,7 +225,7 @@ for _p in (
             "min_abs": ParamSpec(0.0, 0.6),
             "gain": ParamSpec(0.5, 4.0),
         },
-        "Trade decay-weighted intelligence signals (X narrative, Jev decisions, external feeds).",
+        "Trade decay-weighted intelligence signals (X narrative, fast-path model decisions, external feeds).",
     ),
 ):
     register_primitive(_p)

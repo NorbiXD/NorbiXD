@@ -54,6 +54,9 @@ def explain(store: AuditStore, intent_id: str) -> dict[str, Any] | None:
         .where(and_(schema.lineage.c.run_id == run_id, schema.lineage.c.agent_id == intent["agent_id"]))
         .order_by(schema.lineage.c.ts),
     )
+    signals_detail = [
+        row for sid in (intent["signals"] or []) if (row := store.one("signals", signal_id=sid)) is not None
+    ]
     decisions = store.query("risk_decisions", intent_id=intent_id)
     orders = store.query("orders", intent_id=intent_id)
     fills: list[dict[str, Any]] = []
@@ -101,6 +104,7 @@ def explain(store: AuditStore, intent_id: str) -> dict[str, Any] | None:
             "snapshot": snapshot,
             "features_seen": intent["features"],
             "signals_seen": intent["signals"],
+            "signals_detail": signals_detail,
             "components": intent["components"],
             "regime": intent["regime"],
             "provider": intent["provider"],

@@ -143,6 +143,7 @@ class DarwinEngine:
         self.recent_decisions: deque[dict[str, Any]] = deque(maxlen=300)
         self.equity_curve: deque[tuple[int, float]] = deque(maxlen=20_000)
         self.recent_lineage: deque[dict[str, Any]] = deque(maxlen=300)
+        self.recent_signals: deque[dict[str, Any]] = deque(maxlen=200)
         self.venue_equity: float | None = None
         self.last_evolution: EvolutionResult | None = None
         #: held by drivers while mutating and by API readers; uncontended in single-loop modes
@@ -227,12 +228,45 @@ class DarwinEngine:
             if ev.account == CHALLENGE:
                 self.venue_equity = ev.equity
         elif isinstance(ev, IntelligenceSignal):
-            self.signals.add(ev)
-            self.stats["signals"] += 1
+            self._on_signal(ev)
         elif isinstance(ev, TimerEvent):
             self._on_timer(ev)
         elif isinstance(ev, FeedStatus):
             self._on_feed_status(ev)
+
+    def _on_signal(self, ev: IntelligenceSignal) -> None:
+        self.signals.add(ev)
+        self.stats["signals"] += 1
+        self.recent_signals.append(
+            {
+                "signal_id": ev.signal_id,
+                "ts": ev.ts,
+                "source": ev.source,
+                "provider": ev.provider,
+                "symbol": ev.symbol,
+                "topic": ev.topic,
+                "value": ev.value,
+                "confidence": ev.confidence,
+                "summary": str(ev.payload.get("summary") or ev.payload.get("choice") or "")[:200],
+            }
+        )
+        if self.store is not None:
+            self.store.upsert(
+                "signals",
+                {
+                    "signal_id": ev.signal_id,
+                    "ts": ev.ts,
+                    "observed_ts": ev.observed_ts,
+                    "source": ev.source,
+                    "provider": ev.provider,
+                    "symbol": ev.symbol,
+                    "topic": ev.topic,
+                    "value": ev.value,
+                    "confidence": ev.confidence,
+                    "half_life_ms": ev.half_life_ms,
+                    "payload": ev.payload,
+                },
+            )
 
     def _on_feed_status(self, ev: FeedStatus) -> None:
         self._system_event(f"feed_{ev.status}", {"feed": ev.feed, "symbol": ev.symbol, "detail": ev.detail})

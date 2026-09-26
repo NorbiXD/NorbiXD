@@ -84,7 +84,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         server: uvicorn.Server | None = None
         server_task: asyncio.Task[None] | None = None
         if not args.no_api:
-            app = create_app(rt.engine)
+            app = create_app(rt.engine, rt.webhooks)
             server = uvicorn.Server(
                 uvicorn.Config(app, host=cfg.api.host, port=cfg.api.port, log_level="warning")
             )
@@ -120,7 +120,12 @@ def cmd_replay(args: argparse.Namespace) -> int:
     store = AuditStore(cfg.persistence.database_url, run_id=run_id) if not args.no_db else None
     t0 = 1_700_000_000_000
     h = build_replay(
-        cfg, synthetic_stream(cfg, t0, planted=not args.null_market), t0, store=store, run_id=run_id
+        cfg,
+        synthetic_stream(cfg, t0, planted=not args.null_market),
+        t0,
+        store=store,
+        run_id=run_id,
+        intelligence=cfg.intelligence.mock.enabled,
     )
     started = time.time()
     final = h.driver.run()

@@ -14,12 +14,14 @@ import os
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
+from darwin.attribution.analytics import signal_information, species_regime_performance
 from darwin.attribution.explain import explain, find_intent
 from darwin.runtime.engine import CHALLENGE, DarwinEngine, shadow_account
+from darwin.signals.external import WebhookRejected, WebhookSignalFeed
 
 DASHBOARD_DIR = Path(__file__).resolve().parent.parent / "dashboard"
 
@@ -38,9 +40,10 @@ def _jsonable(x: Any) -> Any:
     return x
 
 
-def create_app(engine: DarwinEngine) -> FastAPI:
+def create_app(engine: DarwinEngine, webhooks: dict[str, WebhookSignalFeed] | None = None) -> FastAPI:
     app = FastAPI(title="DARWIN", version="0.1.0", docs_url="/api/docs", openapi_url="/api/openapi.json")
     store = engine.store
+    feeds = webhooks or {}
 
     def locked(fn: Any) -> Any:
         with engine.lock:
@@ -173,6 +176,37 @@ def create_app(engine: DarwinEngine) -> FastAPI:
             raise HTTPException(404, "no decision found")
         return _jsonable(explain(store, iid))
 
+    @app.get("/api/signals/recent")
+    def signals_recent(limit: int = Query(50, le=200)) -> Any:
+        return locked(lambda: list(engine.recent_signals)[-limit:][::-1])
+
+    @app.post("/api/signals/{source}", status_code=202)
+    async def ingest_signal(source: str, request: Request) -> Any:
+        """Authenticated external signal webhook (HMAC-SHA256 over the raw body)."""
+        feed = feeds.get(source)
+        if feed is None:
+            raise HTTPException(404, "unknown or disabled signal source")
+        body = await request.body()
+        try:
+            sig = feed.ingest(body, request.headers.get("X-Darwin-Signature"))
+        except WebhookRejected as e:
+            raise HTTPException(e.status, e.reason) from e
+        return {"accepted": sig.signal_id, "available_at": sig.ts}
+
+    @app.get("/api/attribution/species")
+    def attribution_species() -> Any:
+        if store is None:
+            return []
+        store.flush()
+        return _jsonable(species_regime_performance(store, engine.run_id))
+
+    @app.get("/api/attribution/signals")
+    def attribution_signals() -> Any:
+        if store is None:
+            return []
+        store.flush()
+        return _jsonable(signal_information(store, engine.run_id))
+
     @app.post("/api/kill-switch")
     def kill_switch(req: KillSwitchRequest, authorization: str | None = Header(default=None)) -> Any:
         token = os.environ.get("DARWIN_OPERATOR_TOKEN")
@@ -201,6 +235,7 @@ def create_app(engine: DarwinEngine) -> FastAPI:
                         "lineage": list(engine.recent_lineage)[-25:][::-1],
                         "equity": list(engine.equity_curve)[-600:],
                         "positions": engine.positions(),
+                        "signals": list(engine.recent_signals)[-15:][::-1],
                     }
                 )
                 await ws.send_json(payload)

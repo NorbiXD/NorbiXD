@@ -258,6 +258,23 @@ equity = Table(
     Index("ix_equity_account_ts", "account_id", "ts"),
 )
 
+signals = Table(
+    "signals",
+    metadata,
+    Column("signal_id", String(128), primary_key=True),
+    Column("run_id", String(64), index=True),
+    Column("ts", BigInteger, index=True),  # availability time (when the system received it)
+    Column("observed_ts", BigInteger, nullable=True),
+    Column("source", String(64)),
+    Column("provider", String(128)),
+    Column("symbol", String(32), nullable=True),
+    Column("topic", String(64)),
+    Column("value", Float),
+    Column("confidence", Float),
+    Column("half_life_ms", BigInteger),
+    Column("payload", JSON),
+)
+
 system_events = Table(
     "system_events",
     metadata,
@@ -269,6 +286,7 @@ system_events = Table(
 )
 
 UPSERT_KEYS: dict[str, tuple[str, ...]] = {
+    "signals": ("signal_id",),
     "agents": ("run_id", "agent_id"),
     "orders": ("client_order_id",),
     "genomes": ("genome_id",),

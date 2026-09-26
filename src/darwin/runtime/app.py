@@ -28,11 +28,14 @@ from darwin.exchange.bybit.rest import BybitRest
 from darwin.exchange.bybit.signing import Credentials
 from darwin.exchange.bybit.ws import MAINNET, TESTNET
 from darwin.exchange.sim.venue import SimExchange
+from darwin.intelligence.factory import build_intelligence
 from darwin.market.synthetic import SyntheticMarket
 from darwin.persistence.store import AuditStore
+from darwin.replay.recorder import ParquetRecorder
 from darwin.runtime.engine import CHALLENGE, CHALLENGE_VENUE, SHADOW_VENUE, DarwinEngine
 from darwin.runtime.live import Clock, LiveDriver, SyntheticFeed
 from darwin.runtime.replay import build_replay
+from darwin.signals.external import WebhookSignalFeed, webhook_feeds_from_env
 
 log = logging.getLogger(__name__)
 
@@ -66,6 +69,7 @@ class Runtime:
     run: Callable[[], Awaitable[float]]
     cleanup: list[Callable[[], Awaitable[None]]] = field(default_factory=list)
     info: dict[str, Any] = field(default_factory=dict)
+    webhooks: dict[str, WebhookSignalFeed] = field(default_factory=dict)
 
 
 def synthetic_stream(cfg: ChallengeConfig, start_ts: int, planted: bool = True) -> Iterable[Event]:
@@ -102,6 +106,22 @@ def _sim_venues(
     return venues
 
 
+def _attach_intelligence(cfg: ChallengeConfig, engine: DarwinEngine, driver: LiveDriver) -> None:
+    service = build_intelligence(
+        cfg, deliver=lambda ts, sig: driver.schedule(ts, sig, engine), clock_ms=driver.clock.now_ms
+    )
+    if service is not None:
+        engine.observers.append(service.on_bar)
+    if cfg.persistence.record_market_data:
+        driver.recorder = ParquetRecorder(cfg.persistence.parquet_dir, engine.run_id)
+
+
+def _webhooks(cfg: ChallengeConfig, driver: LiveDriver) -> dict[str, WebhookSignalFeed]:
+    return webhook_feeds_from_env(
+        cfg.intelligence.external_webhooks, driver.push, driver.clock.now_ms, cfg.challenge.symbols
+    )
+
+
 def build_runtime(
     cfg: ChallengeConfig,
     store: AuditStore | None,
@@ -115,7 +135,12 @@ def build_runtime(
     if mode is Mode.REPLAY:
         t0 = start_ts if start_ts is not None else 1_700_000_000_000
         h = build_replay(
-            cfg, events if events is not None else synthetic_stream(cfg, t0), t0, store=store, run_id=run_id
+            cfg,
+            events if events is not None else synthetic_stream(cfg, t0),
+            t0,
+            store=store,
+            run_id=run_id,
+            intelligence=cfg.intelligence.mock.enabled,
         )
 
         async def run_replay() -> float:
@@ -129,6 +154,7 @@ def build_runtime(
         clock = Clock(speed=cfg.sim.speed, origin_ms=t0)
         driver = LiveDriver(engine, [], clock)
         driver.venues = _sim_venues(cfg, engine, driver, challenge_sim=True)
+        _attach_intelligence(cfg, engine, driver)
         engine.start()
         feed = SyntheticFeed(driver, events if events is not None else synthetic_stream(cfg, t0))
 
@@ -139,7 +165,12 @@ def build_runtime(
             finally:
                 task.cancel()
 
-        return Runtime(engine=engine, run=run_sim, info={"mode": mode.value, "speed": cfg.sim.speed})
+        return Runtime(
+            engine=engine,
+            run=run_sim,
+            info={"mode": mode.value, "speed": cfg.sim.speed},
+            webhooks=_webhooks(cfg, driver),
+        )
 
     # ---- modes backed by Bybit streams
     endpoints = TESTNET if mode is Mode.TESTNET else MAINNET
@@ -169,6 +200,7 @@ def build_runtime(
         driver.venues = _sim_venues(cfg, engine, driver, challenge_sim=False)
         engine.attach_gateway(CHALLENGE_VENUE, gateway)
         private_feed = BybitPrivateFeed(driver, gateway, endpoints.private_ws, creds, CHALLENGE)
+    _attach_intelligence(cfg, engine, driver)
     engine.start()
 
     async def run_streams() -> float:
@@ -184,7 +216,11 @@ def build_runtime(
                 await c()
 
     return Runtime(
-        engine=engine, run=run_streams, cleanup=cleanup, info={"mode": mode.value, "endpoints": endpoints}
+        engine=engine,
+        run=run_streams,
+        cleanup=cleanup,
+        info={"mode": mode.value, "endpoints": endpoints},
+        webhooks=_webhooks(cfg, driver),
     )
 
 

@@ -13,3 +13,4 @@ data/
 KILL
 dist/
 build/
+.claude/worktrees/

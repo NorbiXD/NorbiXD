@@ -22,6 +22,7 @@ from darwin.config.challenge import ChallengeConfig
 from darwin.core.events import Event, TimerEvent
 from darwin.exchange.scheduler import EventTarget
 from darwin.exchange.sim.venue import Chaos, SimExchange
+from darwin.intelligence.factory import build_intelligence
 from darwin.market.state import MarketDataEvent
 from darwin.persistence.store import AuditStore
 from darwin.runtime.engine import CHALLENGE_VENUE, SHADOW_VENUE, DarwinEngine
@@ -125,9 +126,17 @@ def build_replay(
     run_id: str = "replay",
     chaos: Chaos | None = None,
     timer_ms: int = 5_000,
+    intelligence: bool = False,
 ) -> ReplayHandles:
     engine = DarwinEngine(cfg, run_id=run_id, start_ts=start_ts, store=store)
     driver = ReplayDriver(engine, market, [], timer_ms=timer_ms)
+    if intelligence:
+        # deterministic (mock) providers only: outputs arrive after a simulated latency
+        service = build_intelligence(
+            cfg, deliver=lambda ts, sig: driver.schedule(ts, sig, engine), clock_ms=lambda: engine.now
+        )
+        if service is not None:
+            engine.observers.append(service.on_bar)
     instruments = {s: cfg.instrument(s) for s in cfg.challenge.symbols}
     common = {
         "symbols": cfg.challenge.symbols,
