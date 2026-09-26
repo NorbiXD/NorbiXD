@@ -30,6 +30,9 @@ GitHub push was refused with 403 — the Claude GitHub App lacks access to `Norb
 * Iteration 2: pending (reviews M1 fixes + M2).
 
 ## Findings worth knowing
+* **Default-config 168h replay** (`darwin replay --hours 168`, 1.87M events in 151 s): 42 generations,
+  55 offspring (38 mutated, 17 crossover) vs 13 immigrants (before the QM-1 fix: 14 vs 127); deaths:
+  35 inactive, 33 persistent inferiority; 38 distinct agents funded over time; final equity 197.75.
 * **Evaluation windows must span regimes.** With a 6h window evolution killed trend followers in range
   regimes and never found the planted trend edge; with 24h (6 × 240 bars) it converges on trend-family
   species. Holdout results per champion are high-variance on a single 24h path.
