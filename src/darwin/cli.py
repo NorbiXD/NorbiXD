@@ -7,6 +7,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import socket
 import sys
 import time
 from datetime import UTC, datetime
@@ -71,8 +72,29 @@ def _print_leaderboard(rows: list[dict[str, Any]], limit: int = 30) -> None:
 # --------------------------------------------------------------------------- commands
 
 
+def _port_free(host: str, port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind((host, port))
+        except OSError:
+            return False
+    return True
+
+
+async def _serve_api(server: uvicorn.Server) -> None:
+    """The dashboard/API is observability: its failure must never take trading down."""
+    try:
+        await server.serve()
+    except (SystemExit, OSError) as e:
+        logging.getLogger(__name__).error("API server stopped: %r (trading continues)", e)
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     cfg = _config(args)
+    if not args.no_api and not _port_free(cfg.api.host, cfg.api.port):
+        print(f"API port {cfg.api.host}:{cfg.api.port} is busy; free it or pass --no-api", file=sys.stderr)
+        return 2
     run_id = args.run_id or f"{cfg.challenge.mode.value}-{int(time.time())}"
     store = AuditStore(cfg.persistence.database_url, run_id=run_id)
     rt = build_runtime(cfg, store, run_id)
@@ -88,7 +110,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             server = uvicorn.Server(
                 uvicorn.Config(app, host=cfg.api.host, port=cfg.api.port, log_level="warning")
             )
-            server_task = asyncio.create_task(server.serve())
+            server_task = asyncio.create_task(_serve_api(server))
             print(f"dashboard: http://{cfg.api.host}:{cfg.api.port}/   api docs: /api/docs")
         try:
             final = await rt.run()

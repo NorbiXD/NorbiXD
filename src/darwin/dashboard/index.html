@@ -1,0 +1,521 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DARWIN · live</title>
+<link rel="icon" href="data:,">
+<style>
+  :root {
+    color-scheme: light;
+    --page: #f9f9f7;
+    --surface-1: #fcfcfb;
+    --text-primary: #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted: #898781;
+    --grid: #e1e0d9;
+    --axis: #c3c2b7;
+    --border: rgba(11, 11, 11, 0.10);
+    --series-1: #2a78d6;       /* alive agents / capital / equity */
+    --series-1-wash: rgba(42, 120, 214, 0.10);
+    --series-2: #eb6834;       /* born this generation */
+    --dead: #c3c2b7;
+    --good: #0ca30c;
+    --warning: #fab219;
+    --critical: #d03b3b;
+    --up-text: #006300;
+    --down-text: #b3261e;
+    --font: system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --page: #0d0d0d;
+      --surface-1: #1a1a19;
+      --text-primary: #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted: #898781;
+      --grid: #2c2c2a;
+      --axis: #383835;
+      --border: rgba(255, 255, 255, 0.10);
+      --series-1: #3987e5;
+      --series-1-wash: rgba(57, 135, 229, 0.12);
+      --series-2: #d95926;
+      --dead: #4a4a47;
+      --up-text: #0ca30c;
+      --down-text: #e66767;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface-1: #1a1a19;
+    --text-primary: #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted: #898781;
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --border: rgba(255, 255, 255, 0.10);
+    --series-1: #3987e5;
+    --series-1-wash: rgba(57, 135, 229, 0.12);
+    --series-2: #d95926;
+    --dead: #4a4a47;
+    --up-text: #0ca30c;
+    --down-text: #e66767;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--page); color: var(--text-primary); font: 14px/1.45 var(--font); }
+  header { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; padding: 16px 24px 8px; }
+  header h1 { font-size: 18px; margin: 0; letter-spacing: 0.08em; font-weight: 700; }
+  .pill { font-size: 12px; padding: 2px 10px; border-radius: 999px; border: 1px solid var(--border); color: var(--text-secondary); }
+  .grow { flex: 1; }
+  button.ghost { background: none; border: 1px solid var(--border); color: var(--text-secondary); border-radius: 8px; padding: 4px 10px; font: inherit; font-size: 12px; cursor: pointer; }
+  main { padding: 8px 24px 32px; display: grid; gap: 16px; grid-template-columns: repeat(12, minmax(0, 1fr)); }
+  .card { background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px; padding: 16px; min-width: 0; }
+  .card h2 { font-size: 13px; font-weight: 600; margin: 0 0 2px; }
+  .card .sub { font-size: 12px; color: var(--text-muted); margin: 0 0 12px; }
+  .span-12 { grid-column: span 12; } .span-8 { grid-column: span 8; } .span-7 { grid-column: span 7; }
+  .span-6 { grid-column: span 6; } .span-5 { grid-column: span 5; } .span-4 { grid-column: span 4; }
+  @media (max-width: 1100px) { .span-8, .span-7, .span-6, .span-5, .span-4 { grid-column: span 12; } }
+  .kpis { display: grid; grid-template-columns: 1.6fr repeat(6, 1fr); gap: 16px; }
+  @media (max-width: 1100px) { .kpis { grid-template-columns: repeat(2, 1fr); } .kpis .hero { grid-column: span 2; } }
+  @media (max-width: 600px) { header, main { padding-left: 16px; padding-right: 16px; } }
+  .tile .label { font-size: 12px; color: var(--text-secondary); }
+  .tile .value { font-size: 24px; font-weight: 600; margin-top: 2px; }
+  .tile .delta { font-size: 12px; margin-top: 2px; }
+  .hero .value { font-size: clamp(36px, 8vw, 52px); line-height: 1.05; font-weight: 600; }
+  td.sp { max-width: 190px; overflow: hidden; text-overflow: ellipsis; }
+  .up { color: var(--up-text); } .down { color: var(--down-text); } .muted { color: var(--text-muted); }
+  .status { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; }
+  .status .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+  svg text { fill: var(--text-muted); font: 11px var(--font); font-variant-numeric: tabular-nums; }
+  .chart-wrap { position: relative; }
+  .tooltip { position: absolute; pointer-events: none; background: var(--surface-1); border: 1px solid var(--border);
+             border-radius: 8px; padding: 8px 10px; font-size: 12px; box-shadow: 0 4px 14px rgba(0,0,0,.12);
+             display: none; z-index: 5; min-width: 140px; }
+  .tooltip .tv { font-weight: 600; color: var(--text-primary); font-size: 13px; }
+  .tooltip .tl { color: var(--text-secondary); }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { text-align: left; font-weight: 600; color: var(--text-secondary); border-bottom: 1px solid var(--grid); padding: 6px 8px; white-space: nowrap; }
+  td { border-bottom: 1px solid var(--grid); padding: 5px 8px; white-space: nowrap; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  tr.dead td { color: var(--text-muted); }
+  .scroll { max-height: 420px; overflow: auto; }
+  .meter { width: 72px; height: 6px; border-radius: 3px; background: var(--series-1-wash); display: inline-block; vertical-align: middle; }
+  .meter > span { display: block; height: 6px; border-radius: 3px; background: var(--series-1); }
+  .feed { list-style: none; margin: 0; padding: 0; max-height: 360px; overflow: auto; }
+  .feed li { padding: 7px 0; border-bottom: 1px solid var(--grid); font-size: 12px; display: grid; grid-template-columns: 64px 1fr; gap: 8px; }
+  .feed .when { color: var(--text-muted); font-variant-numeric: tabular-nums; }
+  .feed .what b { font-weight: 600; }
+  .feed .why { color: var(--text-secondary); }
+  .tag { display: inline-block; font-size: 11px; padding: 0 6px; border-radius: 4px; border: 1px solid var(--border); color: var(--text-secondary); margin-right: 4px; }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--text-secondary); margin-bottom: 8px; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; vertical-align: -1px; }
+  .legend i.ring { background: transparent; border: 2px solid var(--text-primary); }
+  .legend i.hollow { background: transparent; border: 2px solid var(--dead); }
+  .hidden { display: none; }
+  .stale { opacity: 0.55; transition: opacity .2s; }
+</style>
+</head>
+<body>
+<header>
+  <h1>DARWIN</h1>
+  <span class="pill" id="mode">—</span>
+  <span class="pill" id="run">—</span>
+  <span class="status" id="safety"></span>
+  <span class="grow"></span>
+  <span class="muted" id="clock">connecting…</span>
+  <button class="ghost" id="theme" type="button" aria-label="Toggle theme">theme</button>
+</header>
+<main id="app">
+  <section class="span-12 kpis">
+    <div class="card tile hero">
+      <div class="label">Challenge equity</div>
+      <div class="value" id="k-equity">—</div>
+      <div class="delta" id="k-equity-delta">—</div>
+    </div>
+    <div class="card tile"><div class="label">Time remaining</div><div class="value" id="k-timer">—</div><div class="delta muted" id="k-timer-sub"></div></div>
+    <div class="card tile"><div class="label">Drawdown from peak</div><div class="value" id="k-dd">—</div><div class="delta muted" id="k-peak"></div></div>
+    <div class="card tile"><div class="label">Generation</div><div class="value" id="k-gen">—</div><div class="delta muted" id="k-bars"></div></div>
+    <div class="card tile"><div class="label">Agents alive / dead</div><div class="value" id="k-pop">—</div><div class="delta muted" id="k-born"></div></div>
+    <div class="card tile"><div class="label">Champion</div><div class="value" id="k-champ">—</div><div class="delta muted" id="k-champ-sp"></div></div>
+    <div class="card tile"><div class="label">Funded agents</div><div class="value" id="k-funded">—</div><div class="delta muted" id="k-cash"></div></div>
+  </section>
+
+  <section class="card span-8">
+    <h2>Equity</h2>
+    <p class="sub">Challenge account, marked every bar · reference line at starting capital · <button class="ghost" id="eq-toggle" type="button">table view</button></p>
+    <div class="chart-wrap" id="eq-wrap"><svg id="eq" width="100%" height="260" role="img" aria-label="Equity over time"></svg><div class="tooltip" id="eq-tip"></div></div>
+    <div class="scroll hidden" id="eq-table"></div>
+  </section>
+
+  <section class="card span-4">
+    <h2>Capital allocation</h2>
+    <p class="sub">Which intelligence holds real capital now (weight of equity)</p>
+    <div class="chart-wrap"><svg id="alloc" width="100%" height="240" role="img" aria-label="Capital allocation by agent"></svg><div class="tooltip" id="alloc-tip"></div></div>
+  </section>
+
+  <section class="card span-12">
+    <h2>Evolution</h2>
+    <p class="sub">Every agent ever born, by generation · lines connect parents to children · hover for genome details</p>
+    <div class="legend">
+      <span><i style="background:var(--series-1)"></i>alive</span>
+      <span><i style="background:var(--series-2)"></i>born this generation</span>
+      <span><i style="background:var(--warning)"></i>⚠ probation (no capital)</span>
+      <span><i class="hollow"></i>✕ dead</span>
+      <span><i class="ring"></i>★ champion</span>
+      <span class="muted">marker size = capital weight</span>
+    </div>
+    <div class="chart-wrap"><svg id="tree" width="100%" height="320" role="img" aria-label="Lineage tree"></svg><div class="tooltip" id="tree-tip"></div></div>
+  </section>
+
+  <section class="card span-7">
+    <h2>Leaderboard</h2>
+    <p class="sub">Ranked by internal fitness (evidence of edge, not luck) · shadow return on standardized capital</p>
+    <div class="scroll"><table id="board"><thead><tr>
+      <th>#</th><th>Agent</th><th>Species</th><th>Status</th><th class="num">Gen</th><th class="num">Trades</th>
+      <th class="num">Shadow return</th><th class="num">Fitness</th><th>Capital</th><th class="num">Live PnL</th>
+    </tr></thead><tbody></tbody></table></div>
+  </section>
+
+  <section class="card span-5">
+    <h2>Mutations &amp; deaths</h2>
+    <p class="sub">Lineage events as they happen</p>
+    <ul class="feed" id="lineage"></ul>
+  </section>
+
+  <section class="card span-7">
+    <h2>Recent AI decisions</h2>
+    <p class="sub">TradeIntents and what the Risk Governor did with them</p>
+    <ul class="feed" id="decisions"></ul>
+  </section>
+
+  <section class="card span-5">
+    <h2>Intelligence signals</h2>
+    <p class="sub">Fast-path model decisions and slow-path narrative, stamped at arrival</p>
+    <ul class="feed" id="signals"></ul>
+  </section>
+
+  <section class="card span-6">
+    <h2>Live positions</h2>
+    <p class="sub">Challenge account, attributed per agent</p>
+    <div class="scroll"><table id="positions"><thead><tr>
+      <th>Agent</th><th>Symbol</th><th class="num">Qty</th><th class="num">Entry</th><th class="num">Mark</th><th class="num">Notional</th><th class="num">Unrealized</th>
+    </tr></thead><tbody></tbody></table></div>
+  </section>
+
+  <section class="card span-6">
+    <h2>Trade history</h2>
+    <p class="sub">Closed round trips in the challenge account</p>
+    <div class="scroll"><table id="trades"><thead><tr>
+      <th>Exit</th><th>Agent</th><th>Symbol</th><th>Side</th><th class="num">Net PnL</th><th class="num">MFE</th><th class="num">MAE</th><th>Exit reason</th>
+    </tr></thead><tbody></tbody></table></div>
+  </section>
+</main>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const SVGNS = "http://www.w3.org/2000/svg";
+const fmtUsd = (x) => x == null ? "—" : "$" + Number(x).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+const fmtPct = (x, d = 2) => x == null ? "—" : (x >= 0 ? "+" : "") + (x * 100).toFixed(d) + "%";
+const fmtNum = (x, d = 2) => x == null ? "—" : Number(x).toFixed(d);
+const hhmm = (ms) => new Date(ms).toISOString().slice(11, 16);
+const dayhm = (ms) => new Date(ms).toISOString().slice(5, 16).replace("T", " ");
+
+function el(tag, attrs = {}, text) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+  if (text != null) e.textContent = text;   // untrusted strings only ever go through textContent
+  return e;
+}
+function svg(tag, attrs = {}) {
+  const e = document.createElementNS(SVGNS, tag);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+  return e;
+}
+function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+function niceTicks(lo, hi, n = 4) {
+  const span = hi - lo || 1, step0 = span / n, mag = Math.pow(10, Math.floor(Math.log10(step0)));
+  const step = [1, 2, 2.5, 5, 10].map((m) => m * mag).find((s) => s >= step0);
+  const out = []; for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-9; v += step) out.push(v);
+  return out;
+}
+
+/* ---------------------------------------------------------------- theme */
+$("theme").addEventListener("click", () => {
+  const root = document.documentElement;
+  const dark = root.dataset.theme ? root.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+  root.dataset.theme = dark ? "light" : "dark";
+  try { localStorage.setItem("darwin-theme", root.dataset.theme); } catch (e) { /* storage may be unavailable */ }
+  redraw();
+});
+try { const t = localStorage.getItem("darwin-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}
+
+/* ---------------------------------------------------------------- state */
+let S = null, equity = [], tree = [], lastGen = null;
+
+function renderKpis(st) {
+  $("mode").textContent = st.mode.toUpperCase();
+  $("run").textContent = st.run_id;
+  $("k-equity").textContent = fmtUsd(st.equity);
+  const d = $("k-equity-delta");
+  d.textContent = `${st.pnl >= 0 ? "▲" : "▼"} ${fmtUsd(Math.abs(st.pnl))} (${fmtPct(st.pnl_pct)}) vs ${fmtUsd(st.starting_capital)} start`;
+  d.className = "delta " + (st.pnl >= 0 ? "up" : "down");
+  const rem = st.remaining_ms, dd = Math.floor(rem / 864e5), hh = Math.floor(rem % 864e5 / 36e5), mm = Math.floor(rem % 36e5 / 6e4);
+  $("k-timer").textContent = st.ended ? "ended" : dd > 0 ? `${dd}d ${hh}h` : `${hh}h ${mm}m`;
+  $("k-timer-sub").textContent = "ends " + dayhm(st.end_ts) + " UTC";
+  $("k-dd").textContent = fmtPct(-st.drawdown, 1);
+  $("k-peak").textContent = "peak " + fmtUsd(st.peak_equity);
+  $("k-gen").textContent = st.generation;
+  $("k-bars").textContent = `${st.bar_index} bars`;
+  $("k-pop").textContent = `${st.alive} / ${st.dead}`;
+  $("k-champ").textContent = st.champion || "none yet";
+  $("k-funded").textContent = st.funded;
+  $("clock").textContent = "market time " + dayhm(st.now) + " UTC";
+  const safety = $("safety"); clear(safety);
+  const bad = st.kill_switch ? "Kill switch engaged" : st.breaker ? "Circuit breaker: " + st.breaker :
+    Object.entries(st.health).filter(([, h]) => !h.connected || !h.reconcile_ok).map(([k]) => k + " venue degraded")[0];
+  const dot = el("span", {class: "dot"}); dot.style.background = bad ? "var(--critical)" : "var(--good)";
+  safety.append(dot, document.createTextNode(bad ? "✕ " + bad : "✓ Risk envelope nominal"));
+}
+
+/* ---------------------------------------------------------------- equity line */
+function drawEquity() {
+  const node = $("eq"); clear(node);
+  if (!S || equity.length < 2) return;
+  const W = node.clientWidth || 800, H = 260, m = {l: 56, r: 16, t: 12, b: 26};
+  const xs = equity.map((p) => p[0]), ys = equity.map((p) => p[1]);
+  const start = S.starting_capital;
+  let lo = Math.min(start, ...ys), hi = Math.max(start, ...ys); const pad = (hi - lo) * 0.1 || 1; lo -= pad; hi += pad;
+  const x = (t) => m.l + (t - xs[0]) / (xs[xs.length - 1] - xs[0] || 1) * (W - m.l - m.r);
+  const y = (v) => m.t + (hi - v) / (hi - lo) * (H - m.t - m.b);
+  const ticks = niceTicks(lo, hi), step = ticks.length > 1 ? ticks[1] - ticks[0] : 1;
+  const dec = step >= 1 ? 0 : step >= 0.1 ? 1 : 2;  // enough decimals that tick labels stay distinct
+  for (const v of ticks) {
+    node.append(svg("line", {x1: m.l, x2: W - m.r, y1: y(v), y2: y(v), stroke: "var(--grid)", "stroke-width": 1}));
+    const t = svg("text", {x: m.l - 8, y: y(v) + 4, "text-anchor": "end"}); t.textContent = "$" + v.toFixed(dec); node.append(t);
+  }
+  const nx = W < 560 ? 2 : 5;
+  for (let i = 0; i < nx; i++) {
+    const tt = xs[0] + (xs[xs.length - 1] - xs[0]) * i / (nx - 1);
+    const t = svg("text", {x: x(tt), y: H - 6, "text-anchor": i === 0 ? "start" : i === nx - 1 ? "end" : "middle"});
+    t.textContent = dayhm(tt); node.append(t);
+  }
+  node.append(svg("line", {x1: m.l, x2: W - m.r, y1: y(start), y2: y(start), stroke: "var(--axis)", "stroke-width": 1}));
+  const refLbl = svg("text", {x: W - m.r, y: y(start) - 4, "text-anchor": "end"}); refLbl.textContent = "start " + fmtUsd(start); node.append(refLbl);
+  const d = equity.map((p, i) => (i ? "L" : "M") + x(p[0]).toFixed(1) + "," + y(p[1]).toFixed(1)).join("");
+  node.append(svg("path", {d: d + `L${x(xs[xs.length - 1])},${H - m.b}L${x(xs[0])},${H - m.b}Z`, fill: "var(--series-1-wash)", stroke: "none"}));
+  node.append(svg("path", {d, fill: "none", stroke: "var(--series-1)", "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round"}));
+  const last = equity[equity.length - 1];
+  node.append(svg("circle", {cx: x(last[0]), cy: y(last[1]), r: 4, fill: "var(--series-1)", stroke: "var(--surface-1)", "stroke-width": 2}));
+  const endLbl = svg("text", {x: x(last[0]) - 8, y: y(last[1]) - 10, "text-anchor": "end"}); endLbl.textContent = fmtUsd(last[1]); endLbl.style.fill = "var(--text-primary)"; node.append(endLbl);
+  // crosshair + tooltip (snaps to nearest bar)
+  const cross = svg("line", {y1: m.t, y2: H - m.b, stroke: "var(--axis)", "stroke-width": 1, visibility: "hidden"}); node.append(cross);
+  const dotH = svg("circle", {r: 4, fill: "var(--series-1)", stroke: "var(--surface-1)", "stroke-width": 2, visibility: "hidden"}); node.append(dotH);
+  const hit = svg("rect", {x: m.l, y: m.t, width: W - m.l - m.r, height: H - m.t - m.b, fill: "transparent"}); node.append(hit);
+  const tip = $("eq-tip");
+  hit.addEventListener("pointermove", (ev) => {
+    const r = node.getBoundingClientRect(), px = ev.clientX - r.left;
+    let best = 0, bd = Infinity; equity.forEach((p, i) => { const dd = Math.abs(x(p[0]) - px); if (dd < bd) { bd = dd; best = i; } });
+    const p = equity[best]; cross.setAttribute("x1", x(p[0])); cross.setAttribute("x2", x(p[0])); cross.setAttribute("visibility", "visible");
+    dotH.setAttribute("cx", x(p[0])); dotH.setAttribute("cy", y(p[1])); dotH.setAttribute("visibility", "visible");
+    clear(tip); tip.append(el("div", {class: "tv"}, fmtUsd(p[1])), el("div", {class: "tl"}, dayhm(p[0]) + " UTC · " + fmtPct(p[1] / start - 1)));
+    tip.style.display = "block"; tip.style.left = Math.min(x(p[0]) + 12, W - 170) + "px"; tip.style.top = (y(p[1]) - 10) + "px";
+  });
+  hit.addEventListener("pointerleave", () => { tip.style.display = "none"; cross.setAttribute("visibility", "hidden"); dotH.setAttribute("visibility", "hidden"); });
+}
+$("eq-toggle").addEventListener("click", () => {
+  const t = $("eq-table"), w = $("eq-wrap"); const show = t.classList.contains("hidden");
+  t.classList.toggle("hidden", !show); w.classList.toggle("hidden", show);
+  $("eq-toggle").textContent = show ? "chart view" : "table view";
+  if (show) {
+    clear(t); const tb = el("table"); const hr = el("tr"); hr.append(el("th", {}, "Time (UTC)"), el("th", {class: "num"}, "Equity"));
+    tb.append(hr); equity.slice(-300).reverse().forEach((p) => { const r = el("tr"); r.append(el("td", {}, dayhm(p[0])), el("td", {class: "num"}, fmtUsd(p[1]))); tb.append(r); });
+    t.append(tb);
+  }
+});
+
+/* ---------------------------------------------------------------- allocation bars */
+function drawAlloc(allocs) {
+  const node = $("alloc"); clear(node);
+  const W = node.clientWidth || 360, rowH = 34, m = {l: 58, r: 56, t: 6};
+  const rows = allocs.slice(0, 6); const cash = 1 - allocs.reduce((a, b) => a + b.weight, 0);
+  rows.push({agent_id: "cash", weight: Math.max(cash, 0), species: "unallocated", cash: true});
+  node.setAttribute("height", m.t + rows.length * rowH + 4);
+  const x = (w) => (W - m.l - m.r) * w;
+  const tip = $("alloc-tip");
+  rows.forEach((a, i) => {
+    const yy = m.t + i * rowH, bh = 14;
+    const lbl = svg("text", {x: m.l - 8, y: yy + bh - 2, "text-anchor": "end"}); lbl.textContent = a.agent_id; lbl.style.fill = "var(--text-secondary)"; node.append(lbl);
+    const sp = svg("text", {x: m.l, y: yy + bh + 13}); sp.textContent = a.species.length > 36 ? a.species.slice(0, 35) + "…" : a.species; node.append(sp);
+    const w = Math.max(x(a.weight), a.weight > 0 ? 3 : 0);
+    // 4px rounded data-end, square at the baseline
+    const r = Math.min(4, w / 2);
+    const path = `M${m.l},${yy}H${m.l + w - r}Q${m.l + w},${yy} ${m.l + w},${yy + r}V${yy + bh - r}Q${m.l + w},${yy + bh} ${m.l + w - r},${yy + bh}H${m.l}Z`;
+    const bar = svg("path", {d: path, fill: a.cash ? "var(--dead)" : "var(--series-1)"}); node.append(bar);
+    const v = svg("text", {x: m.l + w + 6, y: yy + bh - 2}); v.textContent = (a.weight * 100).toFixed(0) + "%"; v.style.fill = "var(--text-primary)"; node.append(v);
+    const hit = svg("rect", {x: 0, y: yy - 4, width: W, height: rowH, fill: "transparent", tabindex: 0}); node.append(hit);
+    const show = () => { clear(tip); tip.append(el("div", {class: "tv"}, a.cash ? (a.weight * 100).toFixed(1) + "% held in cash" : fmtUsd(a.capital) + " · " + (a.weight * 100).toFixed(1) + "%"), el("div", {class: "tl"}, a.agent_id + " · " + a.species)); tip.style.display = "block"; tip.style.left = "60px"; tip.style.top = (yy + 22) + "px"; bar.setAttribute("opacity", "0.8"); };
+    hit.addEventListener("pointermove", show); hit.addEventListener("focus", show);
+    const hide = () => { tip.style.display = "none"; bar.removeAttribute("opacity"); };
+    hit.addEventListener("pointerleave", hide); hit.addEventListener("blur", hide);
+  });
+  $("k-cash").textContent = (Math.max(cash, 0) * 100).toFixed(0) + "% in cash";
+}
+
+/* ---------------------------------------------------------------- lineage tree */
+function drawTree() {
+  const node = $("tree"); clear(node);
+  if (!tree.length) return;
+  const W = node.clientWidth || 1200, m = {l: 40, r: 20, t: 16, b: 28};
+  const gens = [...new Set(tree.map((a) => a.generation))].sort((a, b) => a - b);
+  const byGen = {}; tree.forEach((a) => (byGen[a.generation] = byGen[a.generation] || []).push(a));
+  const maxN = Math.max(...Object.values(byGen).map((g) => g.length));
+  const colW = (W - m.l - m.r) / Math.max(gens.length, 1);
+  const rowH = Math.max(10, Math.min(22, 280 / maxN));
+  const H = m.t + m.b + maxN * rowH; node.setAttribute("height", Math.max(H, 160));
+  const pos = {};
+  gens.forEach((g, gi) => {
+    const list = byGen[g].sort((a, b) => (a.status === "dead") - (b.status === "dead") || (b.fitness ?? -1e9) - (a.fitness ?? -1e9));
+    list.forEach((a, i) => { pos[a.agent_id] = {x: m.l + colW * (gi + 0.5), y: m.t + rowH * (i + 0.5)}; });
+    const t = svg("text", {x: m.l + colW * (gi + 0.5), y: H - 8, "text-anchor": "middle"}); t.textContent = "gen " + g; node.append(t);
+  });
+  const edges = svg("g"), nodes = svg("g"); node.append(edges, nodes);
+  const edgeEls = [];
+  tree.forEach((a) => a.parents.forEach((p) => {
+    if (!pos[p] || !pos[a.agent_id]) return;
+    const s = pos[p], d = pos[a.agent_id], mx = (s.x + d.x) / 2;
+    const e = svg("path", {d: `M${s.x},${s.y}C${mx},${s.y} ${mx},${d.y} ${d.x},${d.y}`, fill: "none", stroke: "var(--axis)", "stroke-width": 1});
+    e.dataset.child = a.agent_id; e.dataset.parent = p; edges.append(e); edgeEls.push(e);
+  }));
+  const tip = $("tree-tip"); const maxGen = gens[gens.length - 1];
+  tree.forEach((a) => {
+    const p = pos[a.agent_id]; const dead = a.status === "dead";
+    const r = 4 + Math.min(6, a.weight * 16);
+    const fill = dead ? "transparent" : a.status === "probation" ? "var(--warning)" : a.generation === maxGen && a.generation > 0 ? "var(--series-2)" : "var(--series-1)";
+    const g = svg("g", {tabindex: 0});
+    if (a.champion) g.append(svg("circle", {cx: p.x, cy: p.y, r: r + 4, fill: "none", stroke: "var(--text-primary)", "stroke-width": 1.5}));
+    g.append(svg("circle", {cx: p.x, cy: p.y, r, fill, stroke: dead ? "var(--dead)" : "var(--surface-1)", "stroke-width": 2}));
+    if (dead) { const x1 = svg("path", {d: `M${p.x - 2.5},${p.y - 2.5}L${p.x + 2.5},${p.y + 2.5}M${p.x + 2.5},${p.y - 2.5}L${p.x - 2.5},${p.y + 2.5}`, stroke: "var(--dead)", "stroke-width": 1.5}); g.append(x1); }
+    g.append(svg("circle", {cx: p.x, cy: p.y, r: 12, fill: "transparent"}));  // generous hit target
+    const show = () => {
+      clear(tip);
+      tip.append(el("div", {class: "tv"}, a.agent_id + (a.champion ? " ★ champion" : "")),
+        el("div", {class: "tl"}, a.species), el("div", {class: "tl"}, `status ${a.status}${a.death_reason ? " · " + a.death_reason : ""}`),
+        el("div", {class: "tl"}, `fitness ${a.fitness == null ? "—" : a.fitness.toFixed(3)} · capital ${(a.weight * 100).toFixed(0)}%`),
+        el("div", {class: "tl"}, a.parents.length ? "parents " + a.parents.join(" × ") : "no parents (seed / immigrant)"));
+      tip.style.display = "block"; tip.style.left = Math.min(p.x + 14, W - 220) + "px"; tip.style.top = (p.y + 8) + "px";
+      edgeEls.forEach((e) => { if (e.dataset.child === a.agent_id || e.dataset.parent === a.agent_id) { e.setAttribute("stroke", "var(--series-1)"); e.setAttribute("stroke-width", 2); } });
+    };
+    const hide = () => { tip.style.display = "none"; edgeEls.forEach((e) => { e.setAttribute("stroke", "var(--axis)"); e.setAttribute("stroke-width", 1); }); };
+    g.addEventListener("pointerenter", show); g.addEventListener("focus", show); g.addEventListener("pointerleave", hide); g.addEventListener("blur", hide);
+    nodes.append(g);
+  });
+}
+
+/* ---------------------------------------------------------------- tables & feeds */
+function statusCell(r) {
+  const td = el("td"); const s = el("span", {class: "status"}); const dot = el("span", {class: "dot"});
+  const map = {alive: ["var(--series-1)", "alive"], probation: ["var(--warning)", "⚠ probation"], dead: ["var(--dead)", "✕ dead"]};
+  const [c, label] = map[r.status] || ["var(--dead)", r.status];
+  dot.style.background = c; s.append(dot, document.createTextNode(label + (r.death_reason ? " · " + r.death_reason : ""))); td.append(s); return td;
+}
+function renderBoard(rows) {
+  const tb = $("board").querySelector("tbody"); clear(tb);
+  rows.slice(0, 60).forEach((r, i) => {
+    const tr = el("tr", {class: r.status === "dead" ? "dead" : ""});
+    tr.append(el("td", {class: "num"}, String(i + 1)), el("td", {}, r.agent_id + (r.champion ? " ★" : "")), el("td", {class: "sp", title: r.species}, r.species), statusCell(r),
+      el("td", {class: "num"}, String(r.generation)), el("td", {class: "num"}, String(r.trades)));
+    const sr = el("td", {class: "num " + ((r.shadow_return ?? 0) >= 0 ? "up" : "down")}, fmtPct(r.shadow_return)); tr.append(sr);
+    tr.append(el("td", {class: "num"}, r.fitness == null ? "—" : r.fitness.toFixed(3) + (r.eligible ? "" : " ·")));
+    const cap = el("td"); const mt = el("span", {class: "meter"}); const f = el("span"); f.style.width = Math.round(r.weight * 100) + "%"; mt.append(f);
+    cap.append(mt, document.createTextNode(" " + (r.weight * 100).toFixed(0) + "%")); tr.append(cap);
+    tr.append(el("td", {class: "num " + (r.live_pnl >= 0 ? "up" : "down")}, fmtUsd(r.live_pnl)));
+    tb.append(tr);
+  });
+}
+const KIND_LABEL = {born: "born", mutated: "mutated", crossover: "crossover", killed: "✕ killed", promoted: "★ promoted", demoted: "⚠ demoted", reinstated: "reinstated", funded: "funded", defunded: "defunded", proposed: "new species"};
+function mutationText(ev) {
+  const d = ev.details || {};
+  if (ev.kind === "mutated" || ev.kind === "crossover") {
+    const muts = (d.mutations || []).slice(0, 3).map((m) => `${String(m.path).replace(/^terms\[\d+\]\./, "")} ${fmtMaybe(m.before)}→${fmtMaybe(m.after)}`);
+    return `from ${ev.parent_ids.join(" × ")}${muts.length ? " · " + muts.join(", ") : ""}`;
+  }
+  if (ev.kind === "killed") return `${d.reason || ""}${d.strikes ? " · strikes " + d.strikes : ""}${d.equity ? " · equity " + d.equity : ""}`;
+  if (ev.kind === "promoted") return `fitness ${d.fitness}${d.previous ? " · dethroned " + d.previous : ""}`;
+  if (ev.kind === "funded" || ev.kind === "defunded") return `weight ${((d.weight || 0) * 100).toFixed(0)}%`;
+  return d.species || d.origin || "";
+}
+function fmtMaybe(v) { return typeof v === "number" ? (Math.abs(v) >= 100 ? v.toFixed(0) : +v.toFixed(4)) : Array.isArray(v) ? "[" + v.join(",") + "]" : String(v); }
+function renderFeed(id, items, row) {
+  const ul = $(id); clear(ul);
+  items.forEach((it) => { const [when, what, why] = row(it); const li = el("li"); const w = el("div", {class: "what"}); w.append(what);
+    if (why) w.append(el("div", {class: "why"}, why)); li.append(el("div", {class: "when"}, when), w); ul.append(li); });
+}
+function renderLineage(items) {
+  renderFeed("lineage", items, (ev) => {
+    const f = document.createDocumentFragment(); f.append(el("span", {class: "tag"}, KIND_LABEL[ev.kind] || ev.kind), el("b", {}, ev.agent_id), document.createTextNode(" · gen " + ev.generation + " · " + (ev.details?.species || "")));
+    return [hhmm(ev.ts), f, mutationText(ev)];
+  });
+}
+function renderDecisions(items) {
+  renderFeed("decisions", items, (d) => {
+    const f = document.createDocumentFragment();
+    f.append(el("b", {}, d.agent_id), document.createTextNode(` ${d.direction} ${d.symbol} `), el("span", {class: "tag"}, d.reason),
+      document.createTextNode(`conf ${fmtNum(d.confidence)} · target ${d.target_exposure}x · ${d.regime}`));
+    const outs = Object.entries(d.outcomes).map(([book, o]) => `${book}: ${o.approved ? "✓ " + fmtNum(o.order_qty, 4) : "✕ " + (o.reasons[0] || "rejected")}`).join(" · ");
+    const comps = Object.entries(d.components || {}).map(([k, v]) => `${k.split(":")[1]} ${(+v).toFixed(2)}`).join(", ");
+    return [hhmm(d.ts), f, `${d.species} [${comps}] → ${outs || "unfunded / no route"}`];
+  });
+}
+function renderSignals(items) {
+  renderFeed("signals", items, (s) => {
+    const f = document.createDocumentFragment(); f.append(el("span", {class: "tag"}, s.topic), el("b", {}, s.symbol || "market"),
+      document.createTextNode(` ${s.value >= 0 ? "▲" : "▼"} ${fmtNum(s.value)} · conf ${fmtNum(s.confidence)}`));
+    return [hhmm(s.ts), f, `${s.provider}${s.summary ? " · " + s.summary : ""}`];
+  });
+}
+function renderPositions(rows) {
+  const tb = $("positions").querySelector("tbody"); clear(tb);
+  if (!rows.length) { const tr = el("tr"); tr.append(el("td", {colspan: 7, class: "muted"}, "flat")); tb.append(tr); return; }
+  rows.forEach((p) => { const tr = el("tr"); tr.append(el("td", {}, p.agent_id), el("td", {}, p.symbol), el("td", {class: "num"}, fmtNum(p.qty, 4)),
+    el("td", {class: "num"}, fmtNum(p.avg_price, 2)), el("td", {class: "num"}, fmtNum(p.mark, 2)), el("td", {class: "num"}, fmtUsd(p.notional)),
+    el("td", {class: "num " + (p.unrealized >= 0 ? "up" : "down")}, fmtUsd(p.unrealized))); tb.append(tr); });
+}
+function renderTrades(rows) {
+  const tb = $("trades").querySelector("tbody"); clear(tb);
+  rows.slice(0, 80).forEach((t) => { const tr = el("tr"); tr.append(el("td", {}, dayhm(t.exit_ts)), el("td", {}, t.agent_id), el("td", {}, t.symbol),
+    el("td", {}, t.direction > 0 ? "long" : "short"), el("td", {class: "num " + (t.net_pnl >= 0 ? "up" : "down")}, fmtUsd(t.net_pnl)),
+    el("td", {class: "num"}, fmtPct(t.mfe_pct)), el("td", {class: "num"}, fmtPct(t.mae_pct)), el("td", {}, t.exit_reason || "")); tb.append(tr); });
+}
+
+/* ---------------------------------------------------------------- data flow */
+function redraw() { drawEquity(); drawTree(); if (S) drawAlloc(S._allocs || []); }
+function onPayload(p) {
+  document.getElementById("app").classList.remove("stale");
+  S = p.state; S._allocs = p.allocations;
+  renderKpis(S); renderBoard(p.leaderboard); drawAlloc(p.allocations);
+  renderLineage(p.lineage); renderDecisions(p.decisions); renderSignals(p.signals || []); renderPositions(p.positions);
+  const champ = p.leaderboard.find((r) => r.champion); $("k-champ-sp").textContent = champ ? champ.species : "";
+  const born = p.leaderboard.filter((r) => r.generation === S.generation && r.status !== "dead").length;
+  $("k-born").textContent = `${born} born in gen ${S.generation}`;
+  if (lastGen !== S.generation) { lastGen = S.generation; refreshSlow(); }
+}
+async function getJSON(url) { const r = await fetch(url); if (!r.ok) throw new Error(url + " " + r.status); return r.json(); }
+async function refreshSlow() {
+  try {
+    const [eq, tr, tl] = await Promise.all([getJSON("/api/equity?limit=4000"), getJSON("/api/trades?limit=80"), getJSON("/api/lineage/tree")]);
+    equity = eq; tree = tl; renderTrades(tr); drawEquity(); drawTree();
+  } catch (e) { /* keep the previous frame */ }
+}
+function connect() {
+  const ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/api/stream");
+  ws.onmessage = (m) => onPayload(JSON.parse(m.data));
+  ws.onclose = () => { document.getElementById("app").classList.add("stale"); $("clock").textContent = "reconnecting…"; setTimeout(connect, 2000); };
+}
+connect(); refreshSlow(); setInterval(refreshSlow, 5000);
+window.addEventListener("resize", () => { clearTimeout(window._rz); window._rz = setTimeout(redraw, 150); });
+</script>
+</body>
+</html>
