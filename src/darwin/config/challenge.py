@@ -185,6 +185,9 @@ class EvolutionSettings(_Frozen):
     #: at most this many children per parent per generation (crossover counts for both), so one
     #: lucky parent cannot fill the population with near-clones
     max_offspring_per_parent: int = Field(default=2, ge=1)
+    #: an agent whose decision step takes longer than this is quarantined (defence in depth for
+    #: machine-generated species; normal agents take well under a millisecond)
+    max_decide_ms: float = Field(default=500.0, gt=0)
     champion_margin: float = Field(default=0.0, ge=0)
     champion_t_stat: float = Field(default=1.0, ge=0)
     seed_species: tuple[str, ...] = (
@@ -239,11 +242,15 @@ class ProviderSettings(_Frozen):
 
 class JevSettings(ProviderSettings):
     base_url: str = "https://api.typesafe.ai"
+    timeout_s: float = 20.0
 
 
 class GrokSettings(ProviderSettings):
     base_url: str = "https://api.x.ai"
     interval_s: float = 900.0
+    #: X Search is agentic (several searches per request): 20-60 s is normal; the slow path is
+    #: asynchronous, so a long timeout never delays a trading decision
+    timeout_s: float = 180.0
 
 
 class MockSettings(ProviderSettings):

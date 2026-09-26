@@ -155,7 +155,8 @@ class IntelligenceService:
         h = self._health(name)
         h.failures += 1
         h.consecutive_failures += 1
-        log.warning("provider %s failed: %s", name, err)
+        # the type matters: httpx timeouts stringify to an empty message
+        log.warning("provider %s failed: %s: %s", name, type(err).__name__, err)
         if h.consecutive_failures >= self.max_consecutive_failures:
             h.paused_until = self.clock_ms() + self.pause_ms
             h.consecutive_failures = 0

@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 import math
 import threading
+import time
 from collections import Counter, deque
 from collections.abc import Callable
 from typing import Any
@@ -481,10 +482,15 @@ class DarwinEngine:
         for agent in sorted(self.population.alive, key=lambda a: a.agent_id):
             sacct = self.ledger[shadow_account(agent.agent_id)]
             positions = {s: sacct.agent_qty(agent.agent_id, s) for s in agent.genome.symbols}
+            t_start = time.perf_counter()
             try:
                 intents = agent.decide(views, positions, end_ts, self.bar_ms, self.intent_ids, snap_refs)
             except Exception as exc:  # species code is untrusted: isolate the agent, not the loop
                 self._quarantine(agent, exc)
+                continue
+            took_ms = (time.perf_counter() - t_start) * 1000
+            if took_ms > self.cfg.evolution.max_decide_ms:
+                self._quarantine(agent, TimeoutError(f"decision took {took_ms:.0f} ms (budget exceeded)"))
                 continue
             for intent in intents:
                 self._route(intent)
@@ -1383,6 +1389,12 @@ class DarwinEngine:
             "ended": self.ended,
             "breaker": self.governor.breaker(CHALLENGE),
             "kill_switch": self.governor.kill_switch_active(),
+            "flatten": {
+                "reason": dict(self._flatten_targets()).get(CHALLENGE),
+                "pending": self.flatten_pending(),
+                "challenge_flat": self.is_flat(CHALLENGE),
+            },
+            "venue_positions": dict(self.venue_positions),
             "health": {k: vars(v) for k, v in self.health.items()},
             "stats": dict(self.stats),
             "reject_reasons": dict(self.reject_reasons.most_common(12)),

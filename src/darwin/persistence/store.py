@@ -209,9 +209,12 @@ class AuditStore:
                     conn.execute(self._upsert_stmt(tbl, row) if is_up else insert(tbl).values(**row))
                 n += 1
             except Exception as e:
-                if not isinstance(e, TRANSIENT_ERRORS) and self._dead_letter(name, row, e):
-                    continue
-                # transient, or not even the dead letter could be written: the store is down
+                err: Exception = e
+                if not isinstance(e, TRANSIENT_ERRORS):
+                    store_error = self._dead_letter(name, row, e)
+                    if store_error is None:
+                        continue
+                    err = store_error  # not even the dead letter could be written: the store is down
                 left_rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
                 left_ups: dict[str, dict[tuple[Any, ...], dict[str, Any]]] = defaultdict(dict)
                 for name2, up2, key2, row2 in work[i:]:
@@ -222,12 +225,12 @@ class AuditStore:
                         left_rows[name2].append(row2)
                 self._requeue(left_rows, left_ups)
                 self.failures += 1
-                self.last_error = repr(e)
+                self.last_error = repr(err)
                 self.rows_written += n
-                raise
+                raise err from e if err is not e else None
         return n
 
-    def _dead_letter(self, table: str, row: dict[str, Any], error: BaseException) -> bool:
+    def _dead_letter(self, table: str, row: dict[str, Any], error: BaseException) -> Exception | None:
         log.error("audit row refused by %s, dead-lettering: %r", table, error)
         try:
             with self.engine.begin() as conn:
@@ -239,11 +242,11 @@ class AuditStore:
                         payload=repr(row)[:20000],
                     )
                 )
-        except Exception:
+        except Exception as store_error:
             log.exception("could not write dead letter for %s", table)
-            return False
+            return store_error
         self.dead_lettered += 1
-        return True
+        return None
 
     def _upsert_stmt(self, tbl: Table, row: dict[str, Any]) -> Any:
         keys = schema.UPSERT_KEYS[tbl.name]

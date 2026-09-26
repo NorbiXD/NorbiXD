@@ -229,3 +229,74 @@ def test_proposers() -> None:
     with pytest.raises(DSLError):
         validate(got[1].source)
     assert os.environ.get("DARWIN_NEVER_SET") is None
+
+
+_SQUARE_40 = "".join("    x = x * x\n" for _ in range(40))
+
+
+@pytest.mark.parametrize(
+    "prelude",
+    [
+        "    x = True + True\n",  # QM iteration 3, M4: bools are ints
+        "    x = True\n    x += True\n",
+        "    x = (v.ret(1) > 0) + (v.ret(2) > 0) + 2\n",  # comparison results are bools
+        "    x = -True + -True\n",
+        "    x = abs(True) + max(True, False) + 1\n",
+        "    x = 3\n    if v.funding(1) > 0.01:\n        x = x + 1\n",  # a bomb behind a rare trigger
+    ],
+)
+def test_dsl_arithmetic_is_float_only_so_squaring_bombs_overflow_instead_of_allocating(prelude: str) -> None:
+    import time
+
+    src = _with_body(prelude + _SQUARE_40 + "    return x")
+    parsed = validate(src)  # it is valid DSL...
+    fn = compile_score(parsed)
+
+    class V:
+        def ret(self, n: int) -> float:
+            return 0.01
+
+        def funding(self, n: int) -> float:
+            return 0.05  # trigger fires
+
+    t0 = time.perf_counter()
+    out = fn(V(), {"a": 1.5})
+    assert time.perf_counter() - t0 < 0.05  # ...but it cannot build a 2**40-bit integer
+    assert isinstance(out, float) and out == float("inf")
+
+
+def test_dsl_rejects_augmented_assignment_to_non_names() -> None:
+    with pytest.raises(DSLError):
+        validate(_with_body("    p['a'] += 1\n    return 0.0"))
+
+
+def test_slow_species_are_quarantined_by_the_decision_time_budget() -> None:
+    import time
+
+    from darwin.agents.genome import GeneTerm, Genome, RiskGenes
+    from darwin.agents.params import ParamSpec
+    from darwin.agents.primitives import Primitive, register_primitive
+    from darwin.market.synthetic import SyntheticMarket
+
+    def slow(v: object, p: object) -> float:
+        time.sleep(0.03)
+        return 0.0
+
+    register_primitive(Primitive("test_slow", slow, {"k": ParamSpec(1.0, 2.0)}, "slow"), replace=True)
+    try:
+        cfg = make_config(challenge={"duration_hours": 4}, evolution={"max_decide_ms": 10})
+        g = Genome(
+            terms=(GeneTerm(primitive="test_slow", params={"k": 1.5}, weight=1.0),),
+            symbols=("BTCUSDT",),
+            entry_threshold=0.3,
+            exit_threshold=0.0,
+            risk=RiskGenes(exposure=1.0, stop_loss_pct=0.02, take_profit_pct=0.05, max_hold_bars=60),
+        )
+        m = SyntheticMarket(("BTCUSDT", "ETHUSDT"), T0, 4 * 3_600_000 + 60_000, step_ms=5_000, seed=2)
+        h = build_replay(cfg, m.events(), T0, seed_genomes=[(g, "sandbox:test")])
+        (agent,) = [a for a in h.engine.population.agents.values() if a.genome.genome_id == g.genome_id]
+        h.driver.run()
+        assert not agent.alive and agent.death_reason == "runtime_error"
+        assert h.engine.stats["quarantined"] == 1 and h.engine.ended
+    finally:
+        PRIMITIVES.pop("test_slow", None)

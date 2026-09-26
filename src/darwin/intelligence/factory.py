@@ -35,9 +35,7 @@ def build_intelligence(
             log.warning("jev unavailable, the mock stands in: %s", e)
     if ic.grok.enabled and not deterministic:
         try:
-            narrative = GrokProvider(
-                ic.grok.base_url, model=ic.grok.model, timeout_s=max(ic.grok.timeout_s, 30)
-            )
+            narrative = GrokProvider(ic.grok.base_url, model=ic.grok.model, timeout_s=ic.grok.timeout_s)
         except ProviderError as e:
             if strict:
                 raise

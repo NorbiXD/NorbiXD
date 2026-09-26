@@ -127,7 +127,7 @@ class WebhookSignalFeed:
             raise WebhookRejected(429, "rate limit")
         try:
             p = ExternalSignalPayload.model_validate(json.loads(body, parse_constant=_reject_constant))
-        except (ValidationError, ValueError) as e:  # JSONDecodeError is a ValueError
+        except (ValidationError, ValueError, RecursionError) as e:  # JSONDecodeError is a ValueError
             raise WebhookRejected(422, f"invalid payload: {str(e)[:300]}") from e
         if p.symbol is not None and self.allowed_symbols and p.symbol not in self.allowed_symbols:
             raise WebhookRejected(422, f"symbol {p.symbol} not allowed")

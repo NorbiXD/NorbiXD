@@ -52,6 +52,18 @@ class ReplayDriver:
         self.events = 0
         self.last_ts = engine.start_ts
 
+    def _flush(self) -> None:
+        """Like the live flusher: a failing store halts new challenge risk (and recovers when the
+        store does) instead of aborting the whole backtest; the final flush still raises."""
+        eng = self.engine
+        assert eng.store is not None
+        try:
+            eng.store.flush()
+        except Exception as e:
+            eng.audit_flush_failed(repr(e))
+        else:
+            eng.audit_flush_ok()
+
     # Scheduler protocol --------------------------------------------------------
     def schedule(self, ts: int, event: Event, target: EventTarget) -> None:
         heapq.heappush(self._heap, (ts, _P_VENUE, next(self._seq), target, event))
@@ -96,7 +108,7 @@ class ReplayDriver:
                     next_timer += self.timer_ms
             self.events += 1
             if store is not None and self.events % self.flush_every == 0:
-                store.flush()
+                self._flush()
         # end of stream: close the final bars (triggers challenge end + flattening), then drain
         # venue events, with heartbeats retrying exits, until every account is flat
         with eng.lock:

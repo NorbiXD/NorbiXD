@@ -231,6 +231,11 @@ class SpeciesRegistry:
             if not report.get("passed") or not stages or not all(st.get("passed") for st in stages):
                 log.warning("registry: %s has no passing sandbox report; not loaded", path.name)
                 continue
+            expected = Proposal(source=rec["source"]).proposal_id
+            if rec.get("proposal_id") != expected or name != f"x_{expected.lower()}":
+                # the report was earned by *some* source; this one was not what the sandbox saw
+                log.warning("registry: %s source does not match its proposal id; not loaded", path.name)
+                continue
             if register and name not in PRIMITIVES:
                 register_primitive(make_primitive(name, rec["source"], f"sandbox:{rec['proposal_id']}"))
             best = rec["report"].get("best_genome")

@@ -388,3 +388,85 @@ async def test_bybit_candle_backfill_warms_indicators_without_touching_evidence(
     assert view.ready(60) and view.bars[-1].end_ts == forming  # warm now, nothing from the future
     assert eng.bar_index == 0 and not eng.population.books[next(iter(eng.population.books))].equity
     assert eng.ledger["challenge"].cash == eng.cfg.challenge.starting_capital
+
+
+# ----------------------------------------------------------------------------- QM iteration 3 minors
+
+
+def test_webhook_recursion_bomb_is_rejected_not_a_server_error() -> None:
+    from darwin.signals.external import WebhookRejected, WebhookSignalFeed
+
+    secret = "s3cret-s3cret-s3cret"
+    feed = WebhookSignalFeed(
+        "alpha", secret, lambda s: None, lambda: T0, max_body_bytes=100_000, wall_ms=lambda: 5
+    )
+    head = b'{"id": "deep", "value": 0.1, "confidence": 0.1, "payload": {"x": '
+    body = head + b"[" * 20_000 + b"]" * 20_000 + b"}}"  # 40 KB, signed, deeper than the parser allows
+    with pytest.raises(WebhookRejected) as e:
+        feed.ingest(body, WebhookSignalFeed.sign(secret, body, 5), "5")
+    assert e.value.status == 422  # RecursionError -> 422, never an unhandled 500
+
+
+def test_registry_refuses_a_passing_report_attached_to_different_source(tmp_path: Any) -> None:
+    import json
+
+    from darwin.research.sandbox import Proposal, SpeciesRegistry
+    from tests.test_research import GOOD
+
+    good = Proposal(source=GOOD)
+    evil = GOOD.replace('math.tanh(z / p["s"])', '-math.tanh(z / p["s"])')
+    rec = {
+        "proposal_id": good.proposal_id,  # the id and report the sandbox issued for GOOD...
+        "primitive": good.primitive_name,
+        "source": evil,  # ...re-used for code the sandbox never saw
+        "report": {"passed": True, "stages": [{"stage": s, "passed": True} for s in ("static", "unit")]},
+    }
+    (tmp_path / f"{good.proposal_id}.json").write_text(json.dumps(rec))
+    assert SpeciesRegistry(tmp_path).load(register=True) == []
+    assert good.primitive_name not in PRIMITIVES
+
+
+def test_replay_survives_a_failing_audit_store_and_recovers(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from darwin.persistence.store import AuditStore
+    from darwin.runtime.engine import CHALLENGE_VENUE
+
+    store = AuditStore(f"sqlite:///{tmp_path / 'r.db'}", "r")
+    real = store.flush
+    calls = {"n": 0}
+
+    def flaky() -> int:
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise RuntimeError("database is locked")
+        return real()
+
+    monkeypatch.setattr(store, "flush", flaky)
+    cfg = make_config(challenge={"duration_hours": 1})
+    h = build_replay(cfg, _short_market(1), T0, store=store, run_id="r")
+    h.driver.flush_every = 500
+    h.driver.run()  # used to abort on the first failing flush
+    eng = h.engine
+    assert eng.ended and eng.stats["audit_flush_failures"] >= 1
+    assert eng.health[CHALLENGE_VENUE].halted == ""  # recovered once the store came back
+    st = eng.state()
+    assert st["flatten"]["challenge_flat"] and "venue_positions" in st
+
+
+def test_store_reports_the_store_error_when_even_dead_lettering_fails(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sqlalchemy.exc import OperationalError
+
+    from darwin.persistence.store import AuditStore
+
+    store = AuditStore(f"sqlite:///{tmp_path / 'l.db'}", "r")
+    row = {"intent_id": "I1", "ts": T0, "agent_id": "A", "genome_id": "G", "symbol": "BTCUSDT"}
+    store.add("intents", row)
+    store.add("intents", dict(row))  # a refused row...
+    locked = OperationalError("INSERT", {}, Exception("database is locked"))
+    monkeypatch.setattr(store, "_dead_letter", lambda table, r, err: locked)  # ...while the DB locks up
+    with pytest.raises(OperationalError):
+        store.flush()
+    assert "locked" in (store.last_error or "") and store.pending() >= 1

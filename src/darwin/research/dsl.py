@@ -27,9 +27,14 @@ allowlist over the AST:
 * subscripts only as ``p["<declared param>"]``; no names starting with ``_``;
 * **bounded values, bounded time.** No ``**`` (``10 ** 10 ** 10`` needs no loop), no string
   constants except parameter keys and ``v.signal("<topic>")`` (``"a" * 999999999`` would allocate
-  a gigabyte), and integer constants outside feature arguments are compiled as floats, so every
-  value in the body is a bounded float; ``math.floor/ceil`` return floats. With a bounded node
-  count, execution time is bounded too. The compiled function runs in a namespace containing
+  a gigabyte). Outside feature arguments every arithmetic operand is coerced with ``float()`` at
+  compile time — constants, names, comparison results and bools alike — so repeated squaring
+  (``x = True + True`` then ``x = x * x`` forty times would be a 2^40-bit integer) overflows to
+  ``inf`` instead of allocating memory; ``math.floor/ceil`` return floats. Inside feature
+  arguments (lookbacks) integers stay integers, but no reassignment can happen inside a single
+  expression, so their size is bounded by the node limit. With a bounded node count, execution
+  time is bounded too; the engine additionally quarantines any agent whose decision step
+  exceeds a time budget. The compiled function runs in a namespace containing
   nothing else and is compiled without inheriting the host's ``__future__`` flags.
 
 ``FeatureView`` only exposes past bars, so the feature API is also the leakage boundary.
@@ -229,6 +234,8 @@ def validate(source: str) -> ParsedSpecies:
             continue
         if not isinstance(node, _ALLOWED_BODY):
             raise DSLError(f"line {getattr(node, 'lineno', '?')}: {type(node).__name__} not allowed")
+        if isinstance(node, ast.AugAssign) and not isinstance(node.target, ast.Name):
+            raise DSLError(f"line {node.lineno}: augmented assignment only to a plain name")
         if isinstance(node, ast.Name):
             if node.id.startswith("_"):
                 raise DSLError(f"name {node.id!r} not allowed")
@@ -303,8 +310,14 @@ def _feature_arg_nodes(fn: ast.FunctionDef) -> set[int]:
     return out
 
 
+def _as_float(node: ast.expr) -> ast.expr:
+    return ast.copy_location(ast.Call(func=ast.Name("float", ast.Load()), args=[node], keywords=[]), node)
+
+
 class _FloatConstants(ast.NodeTransformer):
-    """Compile integer constants outside feature-call arguments as floats (bounded values)."""
+    """Outside feature-call arguments: integer constants become floats and every arithmetic
+    operand is wrapped in ``float()``, so no body value can grow without bound (bools and
+    comparison results included). Feature arguments keep integer semantics for lookbacks."""
 
     def __init__(self, keep: set[int]) -> None:
         self.keep = keep
@@ -314,6 +327,29 @@ class _FloatConstants(ast.NodeTransformer):
         if isinstance(v, int) and not isinstance(v, bool) and id(node) not in self.keep:
             return ast.copy_location(ast.Constant(float(v)), node)
         return node
+
+    def visit_BinOp(self, node: ast.BinOp) -> ast.expr:
+        keep = id(node) in self.keep
+        self.generic_visit(node)
+        if not keep:
+            node.left, node.right = _as_float(node.left), _as_float(node.right)
+        return node
+
+    def visit_UnaryOp(self, node: ast.UnaryOp) -> ast.expr:
+        keep = id(node) in self.keep
+        self.generic_visit(node)
+        if not keep and isinstance(node.op, (ast.USub, ast.UAdd)):
+            node.operand = _as_float(node.operand)
+        return node
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> ast.stmt:
+        # x op= y  ->  x = float(x) op float(y)   (targets are plain names: validated)
+        self.generic_visit(node)
+        assert isinstance(node.target, ast.Name)
+        load = ast.copy_location(ast.Name(node.target.id, ast.Load()), node.target)
+        value = ast.BinOp(left=_as_float(load), op=node.op, right=_as_float(node.value))
+        assign = ast.Assign(targets=[node.target], value=ast.copy_location(value, node))
+        return ast.copy_location(assign, node)
 
 
 def _float_floor(x: float) -> float:
