@@ -171,6 +171,29 @@ class Population:
         )
         return agent
 
+    def quarantine(self, agent_id: str, now: int, details: dict[str, Any]) -> Agent | None:
+        """Kill an agent whose code failed at runtime (outside selection: no evidence needed)."""
+        a = self.agents.get(agent_id)
+        if a is None or not a.alive:
+            return None
+        a.status = AgentStatus.DEAD
+        a.died_ts = now
+        a.death_reason = "runtime_error"
+        if self.champion_id == agent_id:
+            self.champion_id = None
+        self.lineage.append(
+            LineageEvent(
+                now,
+                self.generation,
+                a.agent_id,
+                LineageEventKind.KILLED,
+                a.genome.genome_id,
+                a.parent_ids,
+                {"reason": "runtime_error", **details},
+            )
+        )
+        return a
+
     def drain_lineage(self) -> list[LineageEvent]:
         out, self.lineage = self.lineage, []
         return out
@@ -529,14 +552,18 @@ class Population:
         species_count = Counter(a.species for a in self.alive)
         cap = max(1, math.floor(cfg.max_species_share * cfg.population_size))
 
+        offspring: Counter[str] = Counter()
         attempts = 0
         while len(born) < slots - n_imm and attempts < 20 * slots:
             attempts += 1
-            pa = self._tournament(parents)
+            open_parents = [p for p in parents if offspring[p.agent_id] < cfg.max_offspring_per_parent]
+            if not open_parents:
+                break  # every parent has its quota: the rest of the slots go to immigrants
+            pa = self._tournament(open_parents)
             a_agent = self.agents[pa.agent_id]
             muts: list[Mutation]
-            if len(parents) >= 2 and self.rng.random() < cfg.crossover_rate:
-                others = [p for p in parents if p.agent_id != pa.agent_id]
+            if len(open_parents) >= 2 and self.rng.random() < cfg.crossover_rate:
+                others = [p for p in open_parents if p.agent_id != pa.agent_id]
                 pb = self._tournament(others)
                 b_agent = self.agents[pb.agent_id]
                 child = crossover(a_agent.genome, b_agent.genome, self.rng, cfg.max_terms)
@@ -569,6 +596,7 @@ class Population:
                 continue
             existing.add(child.genome_id)
             species_count[child.species] += 1
+            offspring.update(parent_ids)
             born.append(
                 self._new_agent(
                     child,

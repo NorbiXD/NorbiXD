@@ -21,9 +21,11 @@ def cand(
     status: AgentStatus = AgentStatus.ALIVE,
     net: float = 0.0,
     n: int = 300,
-    seed: int = 0,
+    seed: int | None = None,
 ) -> AllocationCandidate:
-    r = mean + 0.001 * np.random.default_rng(seed).standard_normal(n)
+    # distinct noise per agent by default: identical series would be (correctly) de-cloned
+    rng = np.random.default_rng(sum(map(ord, aid)) if seed is None else seed)
+    r = mean + 0.001 * rng.standard_normal(n)
     return AllocationCandidate(aid, status, eligible, fit, 0.0, net, r, tuple(["range"] * n))
 
 

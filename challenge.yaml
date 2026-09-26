@@ -71,7 +71,7 @@ evolution:
   max_terms: 3
   max_species_share: 0.4
   correlation_threshold: 0.7
-  correlation_penalty: 0.5
+  correlation_penalty: 1.0
   champion_t_stat: 1.0
   fitness:
     gamma: 1.0                 # CRRA risk aversion: 1 = log utility (growth-optimal)

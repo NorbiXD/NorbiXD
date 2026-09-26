@@ -59,11 +59,45 @@ def _with_body(body: str) -> str:
         "    return eval('1')",
         "    return math.os.system('id')",
         "    try:\n        return 0.0\n    except Exception:\n        return 0.0",
+        # QM iteration 2: unbounded str/int values, annotations, round
+        "    x = 'a' * 999999999\n    return 0.0",  # a gigabyte without a loop
+        "    return len('abc')",
+        "    return v.signal('x' * 40)",
+        "    return v.signal('" + "t" * 33 + "')",
+        "    return v.signal('a b')",
+        "    return round(1.5)",
+        "    return int(p['a']) * 1.0",  # int() only inside feature-call arguments
+        "    return None",
     ],
 )
 def test_dsl_rejects_escapes(body: str) -> None:
     with pytest.raises(DSLError):
         validate(_with_body(body))
+
+
+def test_dsl_rejects_annotations_evaluated_at_definition_time() -> None:
+    for sig in ("def score(v: math.os, p):", "def score(v, p: open('x')):", "def score(v, p) -> 1:"):
+        with pytest.raises(DSLError):
+            validate(GOOD.replace("def score(v, p):", sig))
+
+
+def test_dsl_values_are_bounded_floats_at_runtime() -> None:
+    src = _with_body(
+        "    big = 999999999 * 999999999 * 999999999 * 999999999\n"
+        "    f = math.floor(big)\n"
+        "    n = v.ret(3 * 2)\n"
+        "    return f"
+    )
+    fn = compile_score(validate(src))
+
+    class V:
+        def ret(self, n: int) -> float:
+            assert isinstance(n, int) and n == 6  # lookback math keeps ints
+            return 0.0
+
+    out = fn(V(), {"a": 1.5})
+    assert isinstance(out, float)  # int constants compiled as floats; floor returns a float
+    assert validate(_with_body("    return v.signal('x_narrative') + v.ret(int(p['a']) * 2)"))
 
 
 def test_dsl_rejects_bad_structure() -> None:

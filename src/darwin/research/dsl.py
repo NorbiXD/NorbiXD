@@ -18,13 +18,19 @@ Why a DSL and not arbitrary Python: a promoted species runs inside the trading p
 *language itself* must make escape impossible, not just a runtime sandbox. The validator is an
 allowlist over the AST:
 
-* no imports, loops, comprehensions, lambdas, try/with, globals, nested defs, star-args, keywords;
+* no imports, loops, comprehensions, lambdas, try/with, globals, nested defs, star-args, keywords,
+  decorators or annotations (annotations are evaluated at definition time);
 * the only attribute access permitted is ``v.<feature API method>`` and ``math.<function>`` — so
   no ``__class__``/``__subclasses__`` escapes, no numpy methods like ``ndarray.tofile``;
-* calls only to those attributes or to ``abs/min/max/float/int/round``;
+* calls only to those attributes or to ``abs/min/max/float``; ``int(...)`` only inside the
+  arguments of a feature call (lookbacks);
 * subscripts only as ``p["<declared param>"]``; no names starting with ``_``;
-* no ``**`` (``10 ** 10 ** 10`` is a denial of service without any loop); bounded size, so
-  execution time is bounded too. The compiled function runs in a namespace containing nothing else.
+* **bounded values, bounded time.** No ``**`` (``10 ** 10 ** 10`` needs no loop), no string
+  constants except parameter keys and ``v.signal("<topic>")`` (``"a" * 999999999`` would allocate
+  a gigabyte), and integer constants outside feature arguments are compiled as floats, so every
+  value in the body is a bounded float; ``math.floor/ceil`` return floats. With a bounded node
+  count, execution time is bounded too. The compiled function runs in a namespace containing
+  nothing else and is compiled without inheriting the host's ``__future__`` flags.
 
 ``FeatureView`` only exposes past bars, so the feature API is also the leakage boundary.
 """
@@ -69,12 +75,12 @@ BUILTINS: dict[str, Callable[..., Any]] = {
     "min": min,
     "max": max,
     "float": float,
-    "int": int,
-    "round": round,
+    "int": int,  # validated: only inside feature-call arguments
 }
 RESERVED = frozenset({"v", "p", "math", *BUILTINS})
 MAX_SOURCE_CHARS = 4_000
 MAX_FUNCTION_NODES = 400
+MAX_TOPIC_CHARS = 32
 
 _ALLOWED_BODY = (
     ast.Return,
@@ -197,18 +203,27 @@ def validate(source: str) -> ParsedSpecies:
     a = fn.args
     if (
         [x.arg for x in a.args] != ["v", "p"]
+        or any(x.annotation is not None or x.type_comment for x in a.args)
         or a.vararg
         or a.kwarg
         or a.kwonlyargs
         or a.defaults
+        or a.kw_defaults
         or a.posonlyargs
         or fn.decorator_list
         or fn.returns
+        or fn.type_comment
+        or getattr(fn, "type_params", None)
     ):
         raise DSLError("signature must be exactly: def score(v, p)")
     nodes = list(ast.walk(ast.Module(body=fn.body, type_ignores=[])))
     if len(nodes) > MAX_FUNCTION_NODES:
         raise DSLError("function too large")
+    in_feature_args = _feature_arg_nodes(fn)
+    topic_args = {
+        id(n.args[0]) for n in nodes if isinstance(n, ast.Call) and _is_feature_call(n, "signal") and n.args
+    }
+    param_keys = {id(n.slice) for n in nodes if isinstance(n, ast.Subscript)}
     for node in nodes:
         if isinstance(node, ast.Module):
             continue
@@ -232,6 +247,8 @@ def validate(source: str) -> ParsedSpecies:
             if isinstance(f, ast.Name):
                 if f.id not in BUILTINS:
                     raise DSLError(f"line {node.lineno}: call to {f.id!r} not allowed")
+                if f.id == "int" and id(node) not in in_feature_args:
+                    raise DSLError(f"line {node.lineno}: int(...) only inside feature-call arguments")
             elif not isinstance(f, ast.Attribute):
                 raise DSLError(f"line {node.lineno}: only v.<feature>(...), math.<fn>(...) or builtins")
             if any(isinstance(arg, ast.Starred) for arg in node.args):
@@ -245,8 +262,18 @@ def validate(source: str) -> ParsedSpecies:
             if isinstance(node.ctx, ast.Store):
                 raise DSLError("cannot assign into p")
         elif isinstance(node, ast.Constant):
-            if not isinstance(node.value, (int, float, bool, str, type(None))):
+            if not isinstance(node.value, (int, float, bool, str)):
                 raise DSLError("unsupported constant")
+            if isinstance(node.value, str):
+                if id(node) in param_keys:
+                    pass  # checked with the subscript
+                elif id(node) in topic_args:
+                    if len(node.value) > MAX_TOPIC_CHARS or not node.value.replace("_", "").isalnum():
+                        raise DSLError(f"line {node.lineno}: bad signal topic")
+                elif node.value:
+                    raise DSLError(f"line {node.lineno}: string constants only as p[...] keys or topics")
+                else:
+                    raise DSLError(f"line {node.lineno}: empty string constant")
             if (
                 isinstance(node.value, (int, float))
                 and not isinstance(node.value, bool)
@@ -256,11 +283,58 @@ def validate(source: str) -> ParsedSpecies:
     return ParsedSpecies(description=description, params=params, source=source)
 
 
+def _is_feature_call(node: ast.Call, name: str | None = None) -> bool:
+    f = node.func
+    return (
+        isinstance(f, ast.Attribute)
+        and isinstance(f.value, ast.Name)
+        and f.value.id == "v"
+        and (name is None or f.attr == name)
+    )
+
+
+def _feature_arg_nodes(fn: ast.FunctionDef) -> set[int]:
+    """ids of every node inside the arguments of a ``v.<feature>(...)`` call (lookback math)."""
+    out: set[int] = set()
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Call) and _is_feature_call(node):
+            for arg in node.args:
+                out.update(id(n) for n in ast.walk(arg))
+    return out
+
+
+class _FloatConstants(ast.NodeTransformer):
+    """Compile integer constants outside feature-call arguments as floats (bounded values)."""
+
+    def __init__(self, keep: set[int]) -> None:
+        self.keep = keep
+
+    def visit_Constant(self, node: ast.Constant) -> ast.Constant:
+        v = node.value
+        if isinstance(v, int) and not isinstance(v, bool) and id(node) not in self.keep:
+            return ast.copy_location(ast.Constant(float(v)), node)
+        return node
+
+
+def _float_floor(x: float) -> float:
+    return float(math.floor(x))
+
+
+def _float_ceil(x: float) -> float:
+    return float(math.ceil(x))
+
+
 def compile_score(parsed: ParsedSpecies) -> Callable[[Any, Mapping[str, float]], float]:
     """Compile a *validated* proposal into ``score(v, p)`` with an empty-by-default namespace."""
-    safe_math = types.SimpleNamespace(**{name: getattr(math, name) for name in MATH_API})
+    validate(parsed.source)  # never compile anything that has not passed the validator
+    safe = {name: getattr(math, name) for name in MATH_API}
+    safe.update(floor=_float_floor, ceil=_float_ceil)
+    safe_math = types.SimpleNamespace(**safe)
     namespace: dict[str, Any] = {"__builtins__": dict(BUILTINS), "math": safe_math}
-    code = compile(parsed.source, "<species>", "exec")
+    tree = ast.parse(parsed.source)
+    fdef = next(n for n in tree.body if isinstance(n, ast.FunctionDef))
+    tree = ast.fix_missing_locations(_FloatConstants(_feature_arg_nodes(fdef)).visit(tree))
+    code = compile(tree, "<species>", "exec", dont_inherit=True)
     exec(code, namespace)
     fn = namespace["score"]
     if not callable(fn):

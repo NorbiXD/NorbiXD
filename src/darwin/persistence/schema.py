@@ -285,6 +285,16 @@ system_events = Table(
     Column("detail", JSON),
 )
 
+dead_letters = Table(
+    "dead_letters",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("run_id", String(64), index=True),
+    Column("table_name", String(48)),
+    Column("error", Text),
+    Column("payload", Text),  # repr of the rejected row: never lost, never blocks the batch
+)
+
 UPSERT_KEYS: dict[str, tuple[str, ...]] = {
     "signals": ("run_id", "signal_id"),
     "agents": ("run_id", "agent_id"),

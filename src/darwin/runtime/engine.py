@@ -144,6 +144,7 @@ class DarwinEngine:
         self.last_reconcile_ts = start_ts
         self._last_prune = start_ts
         self.observers: list[BarObserver] = []
+        self._observer_errors: dict[int, int] = {}
         self.on_resync_needed: Callable[[str], None] | None = None
         self._resync_requested: dict[str, int] = {}
         self.venue_equity_base: float | None = None
@@ -172,6 +173,7 @@ class DarwinEngine:
         if hasattr(chal, "open_account"):
             chal.open_account(CHALLENGE, self.cfg.challenge.starting_capital)
         if self.store is not None:
+            self.store.assert_new_run()
             self.store.upsert(
                 "runs",
                 {
@@ -436,13 +438,22 @@ class DarwinEngine:
         if evolved or self.bar_index % self.cfg.allocator.rebalance_bars == 0:
             self._rebalance(end_ts)
 
-        for obs in self.observers:
-            obs(self, end_ts, views)
+        for obs in list(self.observers):
+            try:
+                obs(self, end_ts, views)
+                self._observer_errors.pop(id(obs), None)
+            except Exception as exc:  # an observer (e.g. intelligence) must never stop trading
+                self._observer_failed(obs, exc)
 
         for agent in sorted(self.population.alive, key=lambda a: a.agent_id):
             sacct = self.ledger[shadow_account(agent.agent_id)]
             positions = {s: sacct.agent_qty(agent.agent_id, s) for s in agent.genome.symbols}
-            for intent in agent.decide(views, positions, end_ts, self.bar_ms, self.intent_ids, snap_refs):
+            try:
+                intents = agent.decide(views, positions, end_ts, self.bar_ms, self.intent_ids, snap_refs)
+            except Exception as exc:  # species code is untrusted: isolate the agent, not the loop
+                self._quarantine(agent, exc)
+                continue
+            for intent in intents:
                 self._route(intent)
 
     def _route(self, intent: TradeIntent, only: str | None = None) -> None:
@@ -520,6 +531,37 @@ class DarwinEngine:
                 "outcomes": outcomes,
             }
         )
+
+    def _quarantine(self, agent: Agent, exc: BaseException) -> None:
+        """An agent raised: kill it (lineage ``runtime_error``), defund it and flatten its books."""
+        err = f"{type(exc).__name__}: {exc}"[:300]
+        log.warning("agent %s (%s) quarantined: %s", agent.agent_id, agent.species, err)
+        self.stats["quarantined"] += 1
+        self._system_event(
+            "agent_runtime_error", {"agent_id": agent.agent_id, "species": agent.species, "error": err}
+        )
+        if self.population.quarantine(agent.agent_id, self.now, {"error": err}) is None:
+            return
+        self.weights.pop(agent.agent_id, None)
+        for acct_id in (shadow_account(agent.agent_id), CHALLENGE):
+            if acct_id not in self.ledger.accounts:
+                continue
+            for aid, sym, _p in self.ledger[acct_id].open_positions():
+                if aid == agent.agent_id and self._exit_due(acct_id, aid, sym):
+                    self._system_exit(acct_id, aid, sym, "runtime_error", None)
+        self._persist_agent(agent)
+        self._persist_lineage(self.population.drain_lineage())
+
+    def _observer_failed(self, obs: BarObserver, exc: BaseException) -> None:
+        n = self._observer_errors.get(id(obs), 0) + 1
+        self._observer_errors[id(obs)] = n
+        err = f"{type(exc).__name__}: {exc}"[:300]
+        log.warning("bar observer %r failed (%d): %s", obs, n, err)
+        self._system_event("observer_error", {"observer": repr(obs)[:120], "error": err, "count": n})
+        if n >= 3:
+            self.observers.remove(obs)
+            self._observer_errors.pop(id(obs), None)
+            self._system_event("observer_disabled", {"observer": repr(obs)[:120]})
 
     def _marks(self) -> dict[str, float]:
         out = dict(self.marks)

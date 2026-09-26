@@ -170,7 +170,10 @@ class EvolutionSettings(_Frozen):
     max_terms: int = Field(default=3, ge=1)
     max_species_share: float = Field(default=0.4, gt=0, le=1)
     correlation_threshold: float = Field(default=0.7, gt=0, lt=1)
-    correlation_penalty: float = Field(default=0.5, ge=0, le=1)
+    correlation_penalty: float = Field(default=1.0, ge=0, le=1)
+    #: at most this many children per parent per generation (crossover counts for both), so one
+    #: lucky parent cannot fill the population with near-clones
+    max_offspring_per_parent: int = Field(default=2, ge=1)
     champion_margin: float = Field(default=0.0, ge=0)
     champion_t_stat: float = Field(default=1.0, ge=0)
     seed_species: tuple[str, ...] = (
@@ -195,6 +198,10 @@ class AllocatorSettings(_Frozen):
     cash_buffer: float = Field(default=0.1, ge=0, lt=1)
     rebalance_bars: int = Field(default=60, ge=1)
     thompson_prior_sd: float = Field(default=0.001, gt=0)
+    #: a candidate whose bar returns correlate above this with a better-ranked funded candidate
+    #: gets no capital (clones must not hold the book); 1.0 disables
+    max_pair_correlation: float = Field(default=0.7, gt=0, le=1)
+    min_overlap_bars: int = Field(default=30, ge=2)
 
 
 class PersistenceSettings(_Frozen):

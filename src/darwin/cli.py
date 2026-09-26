@@ -23,7 +23,7 @@ from darwin.core.types import Mode
 from darwin.evolution.bench import run_bench
 from darwin.evolution.tournament import load_champions, run_tournament
 from darwin.market.synthetic import SyntheticMarket
-from darwin.persistence.store import AuditStore
+from darwin.persistence.store import AuditStore, RunExistsError, new_run_id
 from darwin.replay.recorder import load_events
 from darwin.research.proposer import TemplateProposer
 from darwin.research.sandbox import SandboxSettings, SpeciesRegistry, evaluate_proposal
@@ -102,7 +102,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     if not args.no_api and not _port_free(cfg.api.host, cfg.api.port):
         print(f"API port {cfg.api.host}:{cfg.api.port} is busy; free it or pass --no-api", file=sys.stderr)
         return 2
-    run_id = args.run_id or f"{cfg.challenge.mode.value}-{int(time.time())}"
+    run_id = args.run_id or new_run_id(cfg.challenge.mode.value)
     store = AuditStore(cfg.persistence.database_url, run_id=run_id)
     seeds = load_champions(args.seed_genomes, min_holdout_fitness=0.0) if args.seed_genomes else None
     if seeds is not None:
@@ -153,7 +153,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 def cmd_replay(args: argparse.Namespace) -> int:
     args.mode = Mode.REPLAY.value
     cfg = _config(args)
-    run_id = args.run_id or f"replay-{int(time.time())}"
+    run_id = args.run_id or new_run_id("replay")
     store = AuditStore(cfg.persistence.database_url, run_id=run_id) if not args.no_db else None
     t0 = 1_700_000_000_000
     h = build_replay(
@@ -420,7 +420,11 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    rc: int = args.fn(args)
+    try:
+        rc: int = args.fn(args)
+    except RunExistsError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     return rc
 
 

@@ -11,8 +11,10 @@ Three interchangeable policies, benchmarked against each other in ``darwin bench
   sample, fund agents whose sampled mean is positive with Kelly-like weights ∝ μ̃/σ². Exploration
   comes from posterior uncertainty rather than a fixed ε.
 
-All policies share the same post-processing: at most ``max_funded_agents``, per-agent cap
-``max_weight``, a cash buffer, and an explicit exploration slice for unproven challengers.
+All policies share the same post-processing: diversification (a candidate correlated above
+``max_pair_correlation`` with a better-ranked one is dropped, so clones cannot hold the book), at
+most ``max_funded_agents``, per-agent cap ``max_weight``, a cash buffer, and an explicit
+exploration slice for unproven challengers.
 """
 
 from __future__ import annotations
@@ -55,6 +57,45 @@ class Allocator(Protocol):
     ) -> dict[str, float]: ...
 
 
+def return_correlation(a: np.ndarray, b: np.ndarray, min_overlap: int = 30) -> float | None:
+    """Correlation of two agents' bar returns over their common (most recent) bars.
+
+    Every alive agent is marked on every bar, so the tails of two return series are aligned.
+    ``None`` when the overlap is too short or either series is flat (no evidence either way).
+    """
+    n = min(a.size, b.size)
+    if n < min_overlap:
+        return None
+    x, y = a[-n:], b[-n:]
+    sx, sy = float(np.std(x)), float(np.std(y))
+    if sx < 1e-12 or sy < 1e-12:
+        return None
+    return float(np.corrcoef(x, y)[0, 1])
+
+
+def diversify(
+    ranked: list[AllocationCandidate], cfg: AllocatorSettings
+) -> tuple[list[AllocationCandidate], dict[str, str]]:
+    """Greedy de-cloning: walk candidates best-first, drop any whose returns correlate above
+    ``max_pair_correlation`` with one already kept. Returns (kept, {dropped: kept_twin})."""
+    if cfg.max_pair_correlation >= 1.0:
+        return ranked, {}
+    kept: list[AllocationCandidate] = []
+    dropped: dict[str, str] = {}
+    for c in ranked:
+        twin = None
+        for k in kept:
+            rho = return_correlation(c.bar_returns, k.bar_returns, cfg.min_overlap_bars)
+            if rho is not None and rho > cfg.max_pair_correlation:
+                twin = k.agent_id
+                break
+        if twin is None:
+            kept.append(c)
+        else:
+            dropped[c.agent_id] = twin
+    return kept, dropped
+
+
 def _finalise(raw: dict[str, float], cfg: AllocatorSettings, budget: float) -> dict[str, float]:
     """Top-K, per-agent cap (with redistribution), scale to budget."""
     items = sorted(((k, v) for k, v in raw.items() if v > 0), key=lambda kv: -kv[1])[: cfg.max_funded_agents]
@@ -81,20 +122,33 @@ def _finalise(raw: dict[str, float], cfg: AllocatorSettings, budget: float) -> d
 
 
 def _explore(
-    cands: list[AllocationCandidate], taken: dict[str, float], cfg: AllocatorSettings
+    cands: list[AllocationCandidate], funded: list[AllocationCandidate], cfg: AllocatorSettings
 ) -> dict[str, float]:
-    """Give the exploration slice to the most promising unproven challenger."""
+    """Give the exploration slice to the most promising unproven challenger that is not a clone
+    of an agent already funded (exploration buys new information, not more of the same bet)."""
     if cfg.exploration_budget <= 0:
         return {}
-    unproven = [
-        c
-        for c in cands
-        if not c.eligible and c.status is AgentStatus.ALIVE and c.agent_id not in taken and c.net_return > 0
-    ]
-    if not unproven:
-        return {}
-    best = max(unproven, key=lambda c: c.net_return)
-    return {best.agent_id: min(cfg.exploration_budget, cfg.max_weight)}
+    taken = {c.agent_id for c in funded}
+    unproven = sorted(
+        (
+            c
+            for c in cands
+            if not c.eligible
+            and c.status is AgentStatus.ALIVE
+            and c.agent_id not in taken
+            and c.net_return > 0
+        ),
+        key=lambda c: -c.net_return,
+    )
+    for c in unproven:
+        if cfg.max_pair_correlation < 1.0 and any(
+            (rho := return_correlation(c.bar_returns, f.bar_returns, cfg.min_overlap_bars)) is not None
+            and rho > cfg.max_pair_correlation
+            for f in funded
+        ):
+            continue
+        return {c.agent_id: min(cfg.exploration_budget, cfg.max_weight)}
+    return {}
 
 
 class EqualWeightAllocator:
@@ -109,9 +163,11 @@ class EqualWeightAllocator:
         cfg = self.cfg
         ok = [c for c in cands if c.eligible and c.status is AgentStatus.ALIVE and c.has_edge]
         ok.sort(key=lambda c: -c.adjusted_fitness)
-        explore = _explore(cands, {}, cfg)
+        ok, _ = diversify(ok, cfg)
+        top = ok[: cfg.max_funded_agents]
+        explore = _explore(cands, top, cfg)
         budget = 1 - cfg.cash_buffer - sum(explore.values())
-        out = _finalise({c.agent_id: 1.0 for c in ok}, cfg, budget)
+        out = _finalise({c.agent_id: 1.0 for c in top}, cfg, budget)
         return {**out, **explore}
 
 
@@ -130,7 +186,10 @@ class FitnessWeightedAllocator:
             for c in cands
             if c.eligible and c.status is AgentStatus.ALIVE and c.has_edge and c.ruin_prob <= 0.5
         ]
-        explore = _explore(cands, {}, cfg)
+        ok.sort(key=lambda c: -c.adjusted_fitness)
+        ok, _ = diversify(ok, cfg)
+        ok = ok[: cfg.max_funded_agents]
+        explore = _explore(cands, ok, cfg)
         budget = 1 - cfg.cash_buffer - sum(explore.values())
         if not ok:
             return explore
@@ -173,12 +232,16 @@ class ThompsonAllocator:
             for c in cands
             if c.status is AgentStatus.ALIVE and c.ruin_prob <= 0.5 and c.bar_returns.size >= 30
         ]
-        raw: dict[str, float] = {}
+        scored: list[tuple[float, AllocationCandidate]] = []
         for c in ok:
             m, sd, s2 = self.posterior(c, regime)
             draw = float(rng.normal(m, sd))
             if draw > 0:
-                raw[c.agent_id] = draw / s2
+                scored.append((draw / s2, c))
+        scored.sort(key=lambda t: -t[0])
+        kept, _ = diversify([c for _, c in scored], cfg)
+        keep = {c.agent_id for c in kept}
+        raw = {c.agent_id: w for w, c in scored if c.agent_id in keep}
         budget = 1 - cfg.cash_buffer
         return _finalise(raw, cfg, budget)
 

@@ -77,10 +77,18 @@ def test_bybit_trade_dump_loader(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------- webhooks
 
 
+SECRET = "s3cret-s3cret-s3cret"
+WALL = 1_790_000_000_000
+
+
 def _feed(out: list[IntelligenceSignal]) -> WebhookSignalFeed:
     return WebhookSignalFeed(
-        "alpha", "s3cret-s3cret-s3cret", out.append, lambda: T0, ("BTCUSDT",), max_per_minute=3
+        "alpha", SECRET, out.append, lambda: T0, ("BTCUSDT",), max_per_minute=3, wall_ms=lambda: WALL
     )
+
+
+def _send(feed: WebhookSignalFeed, body: bytes, ts: int = WALL, secret: str = SECRET) -> IntelligenceSignal:
+    return feed.ingest(body, WebhookSignalFeed.sign(secret, body, ts), str(ts))
 
 
 def test_webhook_requires_valid_signature_and_schema() -> None:
@@ -88,31 +96,58 @@ def test_webhook_requires_valid_signature_and_schema() -> None:
     feed = _feed(out)
     body = json.dumps({"id": "a1", "symbol": "BTCUSDT", "value": 0.5, "confidence": 0.9}).encode()
     with pytest.raises(WebhookRejected) as e:
-        feed.ingest(body, "sha256=deadbeef")
+        feed.ingest(body, "sha256=deadbeef", str(WALL))
     assert e.value.status == 401
-    sig = feed.ingest(body, WebhookSignalFeed.sign("s3cret-s3cret-s3cret", body))
-    assert sig.ts == T0 and sig.source == "external:alpha" and out == [sig]
+    sig = _send(feed, body)
+    assert sig.ts == T0 and sig.source == "external:alpha" and sig.topic == "external" and out == [sig]
     with pytest.raises(WebhookRejected) as e:  # replay of the same id
-        feed.ingest(body, WebhookSignalFeed.sign("s3cret-s3cret-s3cret", body))
+        _send(feed, body)
     assert e.value.status == 409
     bad = json.dumps({"symbol": "BTCUSDT", "value": 5, "confidence": 0.9}).encode()
     with pytest.raises(WebhookRejected) as e:
-        feed.ingest(bad, WebhookSignalFeed.sign("s3cret-s3cret-s3cret", bad))
+        _send(feed, bad)
     assert e.value.status == 422
     other = json.dumps({"id": "z", "symbol": "DOGEUSDT", "value": 0.1, "confidence": 0.1}).encode()
     with pytest.raises(WebhookRejected):
-        feed.ingest(other, WebhookSignalFeed.sign("s3cret-s3cret-s3cret", other))
+        _send(feed, other)
+
+
+def test_webhook_rejects_stale_timestamps_nan_impersonation_and_bad_observed_ts() -> None:
+    out: list[IntelligenceSignal] = []
+    feed = _feed(out)
+    ok = json.dumps({"id": "t1", "value": 0.1, "confidence": 0.1}).encode()
+    with pytest.raises(WebhookRejected) as e:  # a captured request replayed 10 minutes later
+        _send(feed, ok, ts=WALL - 600_000)
+    assert e.value.status == 401
+    with pytest.raises(WebhookRejected) as e:  # signature over a different timestamp
+        feed.ingest(ok, WebhookSignalFeed.sign(SECRET, ok, WALL), str(WALL + 1))
+    assert e.value.status == 401
+    with pytest.raises(WebhookRejected) as e:
+        feed.ingest(ok, WebhookSignalFeed.sign(SECRET, ok, WALL), None)
+    assert e.value.status == 401
+    for payload in (
+        b'{"id": "n1", "value": NaN, "confidence": 0.5}',
+        b'{"id": "n2", "value": 0.1, "confidence": 0.5, "payload": {"x": Infinity}}',
+        json.dumps({"id": "n3", "value": 0.1, "confidence": 0.5, "topic": "x_narrative"}).encode(),
+        json.dumps({"id": "n4", "value": 0.1, "confidence": 0.5, "observed_ts": 2**62}).encode(),
+        json.dumps(
+            {"id": "n5", "value": 0.1, "confidence": 0.5, "observed_ts": T0 - 30 * 86_400_000}
+        ).encode(),
+    ):
+        with pytest.raises(WebhookRejected) as e:
+            _send(feed, payload)
+        assert e.value.status == 422, payload
+    assert out == [] and feed.rejected == 8
 
 
 def test_webhook_rate_limit_and_disabled_feed() -> None:
     out: list[IntelligenceSignal] = []
     feed = _feed(out)
     for i in range(3):
-        b = json.dumps({"id": f"x{i}", "value": 0.1, "confidence": 0.1}).encode()
-        feed.ingest(b, WebhookSignalFeed.sign("s3cret-s3cret-s3cret", b))
+        _send(feed, json.dumps({"id": f"x{i}", "value": 0.1, "confidence": 0.1}).encode())
     b = json.dumps({"id": "x9", "value": 0.1, "confidence": 0.1}).encode()
     with pytest.raises(WebhookRejected) as e:
-        feed.ingest(b, WebhookSignalFeed.sign("s3cret-s3cret-s3cret", b))
+        _send(feed, b)
     assert e.value.status == 429
     d = DisabledFeed("telegram", "platform terms do not permit this use")
     assert not d.enabled
@@ -180,12 +215,20 @@ def test_api_explain_and_attribution(api) -> None:  # type: ignore[no-untyped-de
 def test_api_webhook_and_kill_switch(api, monkeypatch: pytest.MonkeyPatch) -> None:  # type: ignore[no-untyped-def]
     client, pushed = api
     body = json.dumps({"id": "w1", "value": -0.4, "confidence": 0.7}).encode()
+    import time
+
+    now = int(time.time() * 1000)
     r = client.post(
         "/api/signals/alpha",
         content=body,
-        headers={"X-Darwin-Signature": WebhookSignalFeed.sign("s3cret-s3cret-s3cret", body)},
+        headers={
+            "X-Darwin-Signature": WebhookSignalFeed.sign("s3cret-s3cret-s3cret", body, now),
+            "X-Darwin-Timestamp": str(now),
+        },
     )
     assert r.status_code == 202 and pushed
+    big = b'{"id": "big", "value": 0.1, "confidence": 0.1, "payload": {"x": "' + b"a" * 40_000 + b'"}}'
+    assert client.post("/api/signals/alpha", content=big).status_code == 413  # before any HMAC work
     assert client.post("/api/signals/alpha", content=body).status_code == 401
     assert client.post("/api/signals/unknown", content=body).status_code == 404
     assert client.post("/api/kill-switch", json={"engage": True}).status_code == 403  # disabled without token

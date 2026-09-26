@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hmac
 import math
 import os
 from pathlib import Path
@@ -186,9 +187,18 @@ def create_app(engine: DarwinEngine, webhooks: dict[str, WebhookSignalFeed] | No
         feed = feeds.get(source)
         if feed is None:
             raise HTTPException(404, "unknown or disabled signal source")
-        body = await request.body()
+        declared = request.headers.get("content-length")
+        if declared is not None and (not declared.isdigit() or int(declared) > feed.max_body_bytes):
+            raise HTTPException(413, "body too large")
+        body = b""
+        async for chunk in request.stream():  # never buffer more than the limit
+            body += chunk
+            if len(body) > feed.max_body_bytes:
+                raise HTTPException(413, "body too large")
         try:
-            sig = feed.ingest(body, request.headers.get("X-Darwin-Signature"))
+            sig = feed.ingest(
+                body, request.headers.get("X-Darwin-Signature"), request.headers.get("X-Darwin-Timestamp")
+            )
         except WebhookRejected as e:
             raise HTTPException(e.status, e.reason) from e
         return {"accepted": sig.signal_id, "available_at": sig.ts}
@@ -212,7 +222,7 @@ def create_app(engine: DarwinEngine, webhooks: dict[str, WebhookSignalFeed] | No
         token = os.environ.get("DARWIN_OPERATOR_TOKEN")
         if not token:
             raise HTTPException(403, "operator endpoint disabled (DARWIN_OPERATOR_TOKEN unset)")
-        if authorization != f"Bearer {token}":
+        if not hmac.compare_digest((authorization or "").encode(), f"Bearer {token}".encode()):
             raise HTTPException(401, "bad token")
         with engine.lock:
             if req.engage:
