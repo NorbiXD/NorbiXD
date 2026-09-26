@@ -34,6 +34,11 @@ uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -e ".[de
 # 4. Paper trading on Bybit's real public streams (no keys needed)
 .venv/bin/darwin run --mode paper
 
+# 4b. Paper trading driven by the real AI providers instead of the mock
+#     (TypeSafe System One fast path + Grok/X Search slow path; refuses to start without the keys)
+export TYPESAFE_API_KEY=...  XAI_API_KEY=...
+.venv/bin/darwin run --mode paper --ai          # or --ai grok / --ai jev
+
 # 5. Testnet (needs BYBIT_TESTNET_API_KEY / _SECRET; refuses a non-flat account)
 .venv/bin/darwin run --mode testnet
 

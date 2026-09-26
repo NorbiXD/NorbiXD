@@ -7,6 +7,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import socket
 import sys
 import time
@@ -56,7 +57,36 @@ def _config(args: argparse.Namespace) -> ChallengeConfig:
         overrides["sim"]["seed"] = args.seed
     if getattr(args, "db", None):
         overrides["persistence"]["database_url"] = args.db
+    if getattr(args, "ai", None):
+        wanted = {p.strip() for p in args.ai.split(",") if p.strip()}
+        unknown = wanted - AI_PROVIDERS.keys()
+        if unknown or not wanted:
+            choices = ", ".join(sorted(AI_PROVIDERS))
+            raise SystemExit(f"--ai: unknown provider(s) {sorted(unknown)}; choose from {choices}")
+        # real models only: the mock is switched off so nothing can silently stand in for them
+        overrides["intelligence"] = {
+            "mock": {"enabled": False},
+            **{name: {"enabled": name in wanted} for name in AI_PROVIDERS},
+        }
     return load_config(args.config, overrides)
+
+
+#: provider name -> environment variable holding its API key
+AI_PROVIDERS = {"jev": "TYPESAFE_API_KEY", "grok": "XAI_API_KEY"}
+
+
+def _check_ai(cfg: ChallengeConfig) -> str | None:
+    """Explain why the requested real-AI setup cannot run, or None if it can."""
+    ic = cfg.intelligence
+    enabled = [n for n in AI_PROVIDERS if getattr(ic, n).enabled]
+    if not enabled:
+        return None
+    if cfg.challenge.mode is Mode.REPLAY:
+        return "AI providers are not called in deterministic replay; use --mode sim or paper"
+    missing = [AI_PROVIDERS[n] for n in enabled if not os.environ.get(AI_PROVIDERS[n])]
+    if missing:
+        return f"AI provider key(s) not set: {', '.join(missing)} (export them or load .env first)"
+    return None
 
 
 def _print_leaderboard(rows: list[dict[str, Any]], limit: int = 30) -> None:
@@ -98,7 +128,12 @@ async def _serve_api(server: uvicorn.Server) -> None:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    cfg = asyncio.run(prepare_config(_config(args)))
+    cfg = _config(args)
+    problem = _check_ai(cfg)
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return 2
+    cfg = asyncio.run(prepare_config(cfg))
     if not args.no_api and not _port_free(cfg.api.host, cfg.api.port):
         print(f"API port {cfg.api.host}:{cfg.api.port} is busy; free it or pass --no-api", file=sys.stderr)
         return 2
@@ -364,6 +399,14 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--keep-api", action="store_true", help="keep serving the dashboard after the end")
     r.add_argument("--seed-genomes", help="champion set JSON from `darwin evolve`")
     r.add_argument("--species-dir", default="./data/species", help="promoted Level-2 species to inject")
+    r.add_argument(
+        "--ai",
+        nargs="?",
+        const="jev,grok",
+        metavar="PROVIDERS",
+        help="use real AI providers (default: jev,grok) instead of the mock; needs TYPESAFE_API_KEY / "
+        "XAI_API_KEY and refuses to start without them",
+    )
     r.set_defaults(fn=cmd_run)
 
     rp = sub.add_parser("replay", help="fast deterministic replay on synthetic data")

@@ -231,12 +231,26 @@ class ProviderSettings(_Frozen):
     extra: dict[str, Any] = Field(default_factory=dict)
 
 
+class JevSettings(ProviderSettings):
+    base_url: str = "https://api.typesafe.ai"
+
+
+class GrokSettings(ProviderSettings):
+    base_url: str = "https://api.x.ai"
+    interval_s: float = 900.0
+
+
+class MockSettings(ProviderSettings):
+    enabled: bool = True
+
+
 class IntelligenceSettings(_Frozen):
     #: names of authenticated webhook feeds; secret in env DARWIN_WEBHOOK_SECRET_<NAME>
     external_webhooks: tuple[str, ...] = ()
-    jev: ProviderSettings = ProviderSettings(base_url="https://api.typesafe.ai")
-    grok: ProviderSettings = ProviderSettings(base_url="https://api.x.ai", interval_s=900.0)
-    mock: ProviderSettings = ProviderSettings(enabled=True)
+    # per-provider classes so a partial override ({"enabled": true}) keeps the right defaults
+    jev: JevSettings = JevSettings()
+    grok: GrokSettings = GrokSettings()
+    mock: MockSettings = MockSettings()
 
 
 class ChallengeConfig(_Frozen):

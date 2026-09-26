@@ -1,7 +1,7 @@
 # progress.md — resume here
 
-_Last updated: 2026-09-26 (session 1)._ Branch: `claude/clever-tesla-kk8pm0` (local commits; the
-GitHub push was refused with 403 — the Claude GitHub App lacks access to `NorbiXD/NorbiXD`).
+_Last updated: 2026-09-26 (session 1)._ Branch: `claude/clever-tesla-kk8pm0`, pushed to
+`NorbiXD/NorbiXD` (the default branch is the owner's GitHub profile README repo: keep DARWIN off it).
 
 ## Environment facts
 * Python 3.12 venv at `.venv` (`uv venv --python 3.12 .venv && uv pip install -e ".[dev,postgres]"`).
@@ -84,7 +84,9 @@ GitHub push was refused with 403 — the Claude GitHub App lacks access to `Norb
    `u` contiguity with `OrderBook.strict_sequence`), then `testnet` (preflight, order/execution
    stream ordering, reconciliation), record Parquet sessions and replay them.
 2. Verify the Jev and xAI response shapes against the live APIs (parsers are strict and tolerant of
-   alternate spellings but were built from public docs only).
+   alternate spellings but were built from public docs only): `darwin run --mode paper --ai`.
+   Cost at defaults: Jev every 5 bars per symbol (~860 calls/day for 3 symbols), Grok + X Search
+   every 15 min (~96 calls/day).
 3. Evolution efficiency — the science table says this is the real gap: longer training on recorded
    data, multi-window (walk-forward) selection instead of one 24h holdout, and a planted-vs-null
    separation test as the acceptance bar. Consider a lineage-family capital cap.

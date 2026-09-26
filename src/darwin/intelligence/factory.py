@@ -23,18 +23,25 @@ def build_intelligence(
     deterministic = cfg.challenge.mode is Mode.REPLAY
     decision: DecisionProvider | None = None
     narrative: NarrativeProvider | None = None
+    # an explicitly enabled real provider that cannot start is an error when no mock is configured:
+    # never let a missing key silently turn "AI mode" into "no AI"
+    strict = not ic.mock.enabled
     if ic.jev.enabled and not deterministic:
         try:
             decision = JevProvider(ic.jev.base_url, model=ic.jev.model, timeout_s=ic.jev.timeout_s)
         except ProviderError as e:
-            log.warning("jev disabled: %s", e)
+            if strict:
+                raise
+            log.warning("jev unavailable, the mock stands in: %s", e)
     if ic.grok.enabled and not deterministic:
         try:
             narrative = GrokProvider(
                 ic.grok.base_url, model=ic.grok.model, timeout_s=max(ic.grok.timeout_s, 30)
             )
         except ProviderError as e:
-            log.warning("grok disabled: %s", e)
+            if strict:
+                raise
+            log.warning("grok unavailable, the mock stands in: %s", e)
     if ic.mock.enabled:
         decision = decision or MockDecisionProvider(seed=cfg.sim.seed)
         narrative = narrative or MockNarrativeProvider(seed=cfg.sim.seed)

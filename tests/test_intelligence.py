@@ -236,3 +236,33 @@ def test_mock_decision_is_deterministic_and_uses_only_the_state() -> None:
     b = m.decide_sync(dreq())
     assert a == b
     assert asyncio.run(m.decide(dreq())) == a
+
+
+def test_ai_flag_enables_real_providers_disables_mock_and_never_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import argparse
+
+    from darwin.cli import _check_ai, _config
+    from darwin.intelligence.factory import build_intelligence
+    from darwin.intelligence.providers.base import ProviderError
+
+    args = argparse.Namespace(config=None, mode="paper", ai="jev,grok")
+    cfg = _config(args)
+    ic = cfg.intelligence
+    assert ic.jev.enabled and ic.grok.enabled and not ic.mock.enabled
+    assert ic.jev.base_url == "https://api.typesafe.ai"  # deep-merged, not replaced
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+    problem = _check_ai(cfg)
+    assert problem is not None and "TYPESAFE_API_KEY" in problem and "XAI_API_KEY" in problem
+    with pytest.raises(ProviderError):  # no key and no mock: refuse, never degrade silently
+        build_intelligence(cfg, lambda sig: None, lambda: 0)
+    monkeypatch.setenv("TYPESAFE_API_KEY", "k")
+    monkeypatch.setenv("XAI_API_KEY", "k")
+    assert _check_ai(cfg) is None
+    svc = build_intelligence(cfg, lambda sig: None, lambda: 0)
+    assert svc is not None
+    assert type(svc.decision).__name__ == "JevProvider" and type(svc.narrative).__name__ == "GrokProvider"
+    only_grok = _config(argparse.Namespace(config=None, mode="paper", ai="grok")).intelligence
+    assert only_grok.grok.enabled and not only_grok.jev.enabled and not only_grok.mock.enabled
